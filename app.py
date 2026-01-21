@@ -136,6 +136,11 @@ def reset_token_valido(usuario_row: dict, token: str) -> bool:
 # =========================
 st.set_page_config(page_title="Rota Presença", layout="wide")
 
+# Listas fixas (ordem solicitada)
+GRADUACOES = ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"]
+ORIGENS = ["QG", "RMCF", "OUTROS"]
+
+
 if "auth_user" not in st.session_state:
     st.session_state.auth_user = None
 
@@ -188,7 +193,7 @@ def ui_cadastro():
 
     c1, c2 = st.columns(2)
     with c1:
-        nome = _clean(st.text_input("Nome completo"))
+        nome = _clean(st.text_input("Nome de Escala"))
         email = _clean(st.text_input("Email"))
         telefone = _clean(st.text_input("Telefone"))
     with c2:
