@@ -115,6 +115,18 @@ def _parse_dt(s: str):
     try:
         return FUSO_BR.localize(datetime.strptime(str(s).strip(), "%d/%m/%Y %H:%M:%S"))
     except Exception:
+    # Fallback: ISO / Postgres timestamp strings
+    try:
+        ss = str(s or '').strip()
+        if ss.endswith('Z'):
+            ss = ss[:-1] + '+00:00'
+        # datetime.fromisoformat aceita 'YYYY-MM-DDTHH:MM:SS' e também 'YYYY-MM-DD HH:MM:SS'
+        dt2 = datetime.fromisoformat(ss)
+        if dt2.tzinfo is None:
+            dt2 = BR_TZ.localize(dt2)
+        return dt2
+    except Exception:
+        pass
         return None
 
 def gerar_senha_temp(tam: int = 10) -> str:
@@ -537,8 +549,8 @@ def _senha_temp_valida(u_dict):
     return _br_now() <= exp_dt
 
 def _senha_confere(u_dict, senha_digitada: str):
-    senha_digitada = str(senha_digitada or "")
-    if str(u_dict.get("Senha", "")) == senha_digitada:
+    senha_digitada = str(senha_digitada or "").strip()
+    if str(u_dict.get("Senha", "")).strip() == senha_digitada:
         return ("REAL", True)
     if _senha_temp_valida(u_dict) and str(u_dict.get("TEMP_SENHA", "")).strip() == senha_digitada:
         return ("TEMP", True)
@@ -983,13 +995,15 @@ try:
             salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True)
             if salvar_btn:
                 agora = _br_now()
-                presenca_insert({
-                    "data_hora": agora.isoformat(),
-                    "origem": u.get("QG_RMCF_OUTROS") or "QG",
-                    "graduacao": u.get("Graduação"),
-                    "nome": u.get("Nome"),
-                    "lotacao": u.get("Lotação"),
-                    "email": str(u.get("Email")).strip().lower()
+                resp_p = presenca_insert({
+                    "usuario_id": u.get("id"),
+                    "nome": u.get("Nome") or u.get("nome") or "",
+                    "graduacao": u.get("Graduação") or u.get("graduacao") or "",
+                    "lotacao": u.get("Lotação") or u.get("lotacao") or "",
+                    "origem": u.get("Origem") or u.get("origem") or "",
+                    "data_hora": _br_now().isoformat(),
+                    "email": (u.get("Email") or u.get("email") or ""),
+                    "telefone": (u.get("Telefone") or u.get("telefone") or None),
                 })
                 buscar_presenca_atualizada.clear()
                 st.rerun()
