@@ -112,21 +112,26 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%d/%m/%Y %H:%M:%S")
 
 def _parse_dt(s: str):
+    """Converte strings para datetime timezone-aware (BR_TZ). Aceita 'DD/MM/YYYY HH:MM:SS' e ISO."""
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if not ss:
+        return None
+    # Formato legado do Sheets
     try:
-        return FUSO_BR.localize(datetime.strptime(str(s).strip(), "%d/%m/%Y %H:%M:%S"))
+        return FUSO_BR.localize(datetime.strptime(ss, "%d/%m/%Y %H:%M:%S"))
     except Exception:
-    # Fallback: ISO / Postgres timestamp strings
+        pass
+    # ISO / Postgres
     try:
-        ss = str(s or '').strip()
-        if ss.endswith('Z'):
-            ss = ss[:-1] + '+00:00'
-        # datetime.fromisoformat aceita 'YYYY-MM-DDTHH:MM:SS' e também 'YYYY-MM-DD HH:MM:SS'
-        dt2 = datetime.fromisoformat(ss)
+        if ss.endswith("Z"):
+            ss = ss[:-1] + "+00:00"
+        dt2 = datetime.fromisoformat(ss.replace("T", " "))
         if dt2.tzinfo is None:
             dt2 = BR_TZ.localize(dt2)
         return dt2
     except Exception:
-        pass
         return None
 
 def gerar_senha_temp(tam: int = 10) -> str:
@@ -220,7 +225,7 @@ def buscar_usuarios_admin():
 
 @st.cache_data(ttl=120)
 def buscar_limite_dinamico():
-    return config_get_int("LIMITE", 100)
+    return config_get_int("limite_usuarios", 100)
 
 @st.cache_data(ttl=6)
 def buscar_presenca_atualizada():
@@ -803,7 +808,7 @@ try:
         novo_limite = st.number_input("Limite máximo de usuários:", value=int(limite_max))
         salvar_lim = st.button("💾 SALVAR NOVO LIMITE")
         if salvar_lim:
-            config_set_int("LIMITE", int(novo_limite))
+            config_set_int("limite_usuarios", int(novo_limite))
             st.success("Limite atualizado!")
             st.rerun()
 
