@@ -449,7 +449,7 @@ def verificar_status_e_limpar_db(presencas_rows):
         try:
             # pega a mais recente
             last = max(presencas_rows, key=lambda r: str(r.get("data_hora", "")) or "")
-            last_dt = pd.to_datetime(last.get("data_hora"), errors="coerce")
+            last_dt = pd.to_datetime(last.get("data_hora"), errors="coerce", dayfirst=True)
             if pd.notna(last_dt):
                 # converte pra fuso
                 if last_dt.tzinfo is None:
@@ -1286,6 +1286,11 @@ try:
                         st.error(f"Falha ao excluir presença: {e}")
 
             elif aberto:
+# --- IDs e ciclo (evita NameError) ---
+usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
+ciclo_data = ciclo_d
+ciclo_hora = ciclo_h
+
                 salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_presenca")
                 if salvar_btn:
                     try:
@@ -1361,4 +1366,9 @@ try:
     )
 
 except Exception as e:
+# --- IDs e ciclo (evita NameError) ---
+usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
+ciclo_data = ciclo_d
+ciclo_hora = ciclo_h
+
     st.error(f"⚠️ Erro: {e}")
