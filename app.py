@@ -3,7 +3,7 @@
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 import pytz
 from fpdf import FPDF
 import urllib.parse
@@ -217,10 +217,11 @@ def enviar_dados_cadastrais_para_email(u_any: dict):
         "",
         f"Nome de Escala: {pick('nome','Nome','Nome de Escala')}",
         f"E-mail: {email}",
-        f"Telefone: {pick('telefone','Telefone')}",
+        f"Telefone: {pick('telefone','Telefone','TELEFONE')}",
         f"Graduação: {pick('graduacao','Graduação')}",
         f"Lotação: {pick('lotacao','Lotação')}",
-        f"Origem: {pick('origem','Origem')}",
+        f"Origem: {pick('origem','Origem','QG_RMCF_OUTROS')}",
+        f"Senha: {pick('senha','Senha','SENHA')}",
         "",
         "(Este e-mail foi enviado automaticamente pelo sistema.)",
     ]
@@ -233,6 +234,55 @@ def usuarios_select(where=None, columns="*"):
             q = q.eq(k, v)
     res = sb_call(q.execute)
     return res.data or []
+
+
+
+def _parse_ts(ts_value):
+    """Parse Supabase timestamptz (ISO string) into aware datetime."""
+    if not ts_value:
+        return None
+    try:
+        if isinstance(ts_value, datetime):
+            dt = ts_value
+        else:
+            s = str(ts_value).strip()
+            # Supabase can return 'Z'
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+        # Ensure tz-aware
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def pode_recuperar_dados_hoje(user_raw: dict):
+    """Permite recuperar/enviar dados no máximo 1 vez por dia (fuso BR)."""
+    last = user_raw.get("last_recuperacao_dados_at") or user_raw.get("ultima_recuperacao_dados_at")
+    dt_last = _parse_ts(last)
+    if not dt_last:
+        return True, None
+
+    now_br = datetime.now(FUSO_BR)
+    last_br = dt_last.astimezone(FUSO_BR)
+    if last_br.date() == now_br.date():
+        # Próxima janela: 00:00 do dia seguinte (fuso BR)
+        next_allowed = (now_br + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return False, next_allowed
+    return True, None
+
+
+def marcar_recuperacao_dados(user_id: str):
+    """Marca o envio como realizado hoje."""
+    try:
+        supabase_admin.table("usuarios").update(
+            {"last_recuperacao_dados_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", user_id).execute()
+    except Exception:
+        # Se falhar, não bloqueia o usuário (apenas não registra o limite)
+        pass
 
 def usuarios_insert(row: dict):
     res = sb_call(sb().table(TB_USUARIOS).insert, row).execute()
@@ -864,11 +914,17 @@ try:
             if btn_email:
                 uid, u_raw, u_ui = _validar_email_senha()
                 if uid and u_ui:
-                    try:
-                        enviar_dados_cadastrais_para_email(u_ui)
-                        st.success("✅ Dados enviados para o e-mail cadastrado.")
-                    except Exception as ex:
-                        st.error(f"Falha ao enviar e-mail: {ex}")
+                    ok, next_allowed = pode_recuperar_dados_hoje(u_raw)
+                    if not ok:
+                        when_txt = next_allowed.strftime("%d/%m/%Y %H:%M") if next_allowed else "amanhã"
+                        st.warning(f"⚠️ Você já recuperou seus dados hoje. Tente novamente {when_txt}.")
+                    else:
+                        try:
+                            enviar_dados_cadastrais_para_email(u_ui)
+                            marcar_recuperacao_dados(uid)
+                            st.success("✅ Dados enviados para o e-mail cadastrado.")
+                        except Exception as ex:
+                            st.error(f"Falha ao enviar e-mail: {ex}")
 
             # 2) EDITAR CADASTRO (substitui o 'Gerar senha temporária')
             if btn_edit:
