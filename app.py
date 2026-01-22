@@ -13,6 +13,8 @@ import re
 
 from supabase import create_client, Client
 from postgrest.exceptions import APIError as PostgrestAPIError
+import smtplib
+from email.message import EmailMessage
 
 # ==========================================================
 # CONFIGURAÇÃO
@@ -137,6 +139,84 @@ def _parse_dt(s: str):
 def gerar_senha_temp(tam: int = 10) -> str:
     alfabeto = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(random.choice(alfabeto) for _ in range(tam))
+
+# ==========================================================
+# EMAIL HELPERS (SMTP)
+# - Configure no Streamlit Secrets (TOML):
+#   EMAIL_HOST = "smtp.gmail.com"
+#   EMAIL_PORT = 587
+#   EMAIL_USER = "seu_email@gmail.com"
+#   EMAIL_PASSWORD = "senha_de_app"
+#   EMAIL_FROM = "seu_email@gmail.com"   # opcional
+#   EMAIL_TLS = true                    # opcional (padrão true)
+# ==========================================================
+def _email_cfg():
+    # st.secrets funciona no Streamlit Cloud
+    s = getattr(st, "secrets", {})
+    host = s.get("EMAIL_HOST")
+    port = s.get("EMAIL_PORT")
+    user = s.get("EMAIL_USER")
+    pwd  = s.get("EMAIL_PASSWORD")
+    if not host or not port or not user or not pwd:
+        raise ValueError("Faltou configurar EMAIL_HOST/EMAIL_PORT/EMAIL_USER/EMAIL_PASSWORD no Secrets.")
+    email_from = s.get("EMAIL_FROM") or user
+    tls = s.get("EMAIL_TLS", True)
+    try:
+        port = int(port)
+    except Exception:
+        raise ValueError("EMAIL_PORT precisa ser número (ex: 587).")
+    return {"host": host, "port": port, "user": user, "pwd": pwd, "from": email_from, "tls": bool(tls)}
+
+def enviar_email(destinatario: str, assunto: str, corpo: str):
+    cfg = _email_cfg()
+    msg = EmailMessage()
+    msg["From"] = cfg["from"]
+    msg["To"] = destinatario
+    msg["Subject"] = assunto
+    msg.set_content(corpo)
+
+    with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as server:
+        if cfg["tls"]:
+            server.starttls()
+        server.login(cfg["user"], cfg["pwd"])
+        server.send_message(msg)
+
+def enviar_dados_cadastrais_para_email(u: dict):
+    email_dest = (u or {}).get("email")
+    if not email_dest:
+        raise ValueError("Usuário sem email cadastrado.")
+
+    campos = [
+        ("Nome", u.get("nome") or ""),
+        ("Email", u.get("email") or ""),
+        ("Telefone", u.get("telefone") or ""),
+        ("Graduação", u.get("graduacao") or ""),
+        ("Lotação", u.get("lotacao") or ""),
+        ("Origem", u.get("origem") or ""),
+    ]
+    # Extras comuns (se existirem)
+    if u.get("created_at"):
+        campos.append(("Criado em", str(u.get("created_at"))))
+    if u.get("updated_at"):
+        campos.append(("Atualizado em", str(u.get("updated_at"))))
+
+    linhas = [
+        "Olá!",
+        "",
+        "Segue abaixo uma cópia dos seus dados cadastrais no sistema Rota Presença:",
+        "",
+    ]
+    for k, v in campos:
+        linhas.append(f"- {k}: {v}")
+    linhas += [
+        "",
+        "Se algum dado estiver incorreto, use o menu RECUPERAR para gerar uma senha temporária e ajustar o cadastro.",
+        "",
+        "Mensagem automática.",
+    ]
+    enviar_email(email_dest, "Seus dados cadastrais - Rota Presença", "\n".join(linhas))
+
+
 
 # ==========================================================
 # DB HELPERS
@@ -761,6 +841,25 @@ try:
                         st.error("Dados não encontrados (verifique e-mail e telefone).")
 
         # -------------------------
+
+            send_btn = st.button("📧 ENVIAR DADOS PARA O EMAIL CADASTRADO 📧", use_container_width=True)
+            if send_btn:
+                if not e_r.strip():
+                    st.error("Informe o e-mail cadastrado.")
+                elif not tel_is_valid_11(fmt_tel_rec):
+                    st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
+                else:
+                    tel_rec_digits = tel_only_digits(fmt_tel_rec)
+                    u_raw = buscar_user_by_email_tel(e_r.strip().lower(), tel_rec_digits)
+                    if not u_raw:
+                        st.error("Dados não encontrados (verifique e-mail e telefone).")
+                    else:
+                        try:
+                            enviar_dados_cadastrais_para_email(u_raw)
+                            st.success("✅ Enviado para o e-mail cadastrado.")
+                            st.info("Se não chegar, verifique SPAM/Lixo eletrônico e confirme as credenciais SMTP no Secrets.")
+                        except Exception as ex:
+                            st.error(f"Falha ao enviar e-mail: {ex}")
         # ADM LOGIN
         # -------------------------
         with t5:
