@@ -896,7 +896,8 @@ try:
                                     "status": "PENDENTE",
                                     "temp_senha": "",
                                     "temp_expira": None,
-                                    "temp_usada": True
+                                    "temp_usada": True,
+                                    "last_recuperacao_dados_at": None
                                 })
                                 buscar_usuarios_cadastrados.clear()
                                 buscar_usuarios_admin.clear()
