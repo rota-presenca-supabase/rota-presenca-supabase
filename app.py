@@ -287,6 +287,22 @@ def config_set_int(key: str, value: int):
             sb_call(sb().table(TB_CONFIG).insert({"key": key, "value": str(int(value))}).execute)
 
 # ==========================================================
+
+
+def buscar_user_by_email_senha(email: str, senha: str):
+    """Busca usuário por Email + Senha REAL (não temporária)."""
+    email = str(email or "").strip().lower()
+    senha = str(senha or "").strip()
+    if not email or not senha:
+        return None, None
+    try:
+        rows = usuarios_select({"email": email, "senha": senha})
+        if rows:
+            u = rows[0]
+            return u.get("id"), u
+    except Exception:
+        pass
+    return None, None
 # LEITURAS (cache_data)
 # ==========================================================
 @st.cache_data(ttl=30)
@@ -657,6 +673,11 @@ def buscar_user_by_email_tel(email: str, tel_digits: str):
 # ==========================================================
 # APP
 # ==========================================================
+if "_edit_cadastro" not in st.session_state:
+    st.session_state._edit_cadastro = False
+if "_edit_user_id" not in st.session_state:
+    st.session_state._edit_user_id = None
+
 try:
     records_u_public_raw = buscar_usuarios_cadastrados()
     records_u_public = [user_to_ui_dict(u) for u in records_u_public_raw]
@@ -805,63 +826,121 @@ try:
         # -------------------------
         with t4:
             st.markdown("### 🔐 Recuperar acesso")
-            st.caption("Confirme **E-mail + Telefone**. Será gerada uma **senha temporária** válida para **apenas 1 acesso** (expira em 10 minutos).")
+            st.caption("Confirme **E-mail + Senha**.")
 
             e_r = st.text_input("E-mail cadastrado:")
-            raw_tel_rec = st.text_input("Telefone cadastrado:", value=st.session_state.get("_tel_rec_fmt", ""))
-            fmt_tel_rec = tel_format_br(raw_tel_rec)
-            st.session_state["_tel_rec_fmt"] = fmt_tel_rec
+            s_r = st.text_input("Senha do usuário:", type="password")
 
-            rec_btn = st.button("👾 GERAR SENHA TEMPORÁRIA 👾", use_container_width=True)
-            if rec_btn:
-                if not e_r.strip():
+            c1, c2 = st.columns(2)
+            with c1:
+                btn_email = st.button("📧 Enviar dados para o Email cadastrado 📧", use_container_width=True)
+            with c2:
+                btn_edit = st.button("✏️ EDITAR CADASTRO ✏️", use_container_width=True)
+
+            def _validar_email_senha():
+                if not str(e_r or "").strip():
                     st.error("Informe o e-mail cadastrado.")
-                elif not tel_is_valid_11(fmt_tel_rec):
-                    st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
-                else:
-                    tel_rec_digits = tel_only_digits(fmt_tel_rec)
-                    u_raw = buscar_user_by_email_tel(e_r.strip().lower(), tel_rec_digits)
+                    return None, None, None
+                if not str(s_r or "").strip():
+                    st.error("Informe a senha do usuário.")
+                    return None, None, None
+                uid, u_raw = buscar_user_by_email_senha(e_r, s_r)
+                if not uid or not u_raw:
+                    st.error("Dados não encontrados (verifique e-mail e senha).")
+                    return None, None, None
+                u_ui = map_user_row(u_raw)
+                return uid, u_raw, u_ui
 
-                    if u_raw:
-                        senha_temp = gerar_senha_temp(10)
-                        expira_dt = _br_now() + timedelta(minutes=10)
+            # 1) MANTER botão e funcionalidade de envio por e-mail (agora validando por e-mail + senha)
+            if btn_email:
+                uid, u_raw, u_ui = _validar_email_senha()
+                if uid and u_ui:
+                    try:
+                        enviar_dados_cadastrais_para_email(u_ui)
+                        st.success("✅ Dados enviados para o e-mail cadastrado.")
+                    except Exception as ex:
+                        st.error(f"Falha ao enviar e-mail: {ex}")
 
-                        usuarios_update({"id": u_raw["id"]}, {
-                            "temp_senha": senha_temp,
-                            "temp_expira": expira_dt.isoformat(),
-                            "temp_usada": False
-                        })
+            # 2) EDITAR CADASTRO (substitui o 'Gerar senha temporária')
+            if btn_edit:
+                uid, u_raw, u_ui = _validar_email_senha()
+                if uid and u_ui:
+                    st.session_state._edit_cadastro = True
+                    st.session_state._edit_user_id = uid
+                    st.session_state._edit_user_ui = u_ui
 
-                        buscar_usuarios_cadastrados.clear()
-                        buscar_usuarios_admin.clear()
+            if st.session_state.get("_edit_cadastro", False):
+                u_ui = st.session_state.get("_edit_user_ui") or {}
+                st.divider()
+                st.subheader("✏️ Editar cadastro (o e-mail não pode ser alterado)")
 
-                        st.success("✅ Senha temporária gerada com sucesso.")
-                        st.info(f"🔑 **Senha temporária:** `{senha_temp}`\n\n⏳ Expira em: {_fmt_dt(expira_dt)}\n\n⚠️ Válida para **apenas 1 acesso**.")
-                    else:
-                        st.error("Dados não encontrados (verifique e-mail e telefone).")
+                # Opções fixas (ordem solicitada)
+                grad_opcoes = ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"]
+                origem_opcoes = ["QG", "RMCF", "OUTROS"]
 
-        # -------------------------
+                with st.form("form_editar_cadastro"):
+                    nome_novo = st.text_input("Nome de Escala:", value=str(u_ui.get("Nome", "") or ""))
+                    tel_novo_raw = st.text_input("Telefone:", value=tel_format_br(u_ui.get("TELEFONE", "") or ""))
+                    tel_novo_fmt = tel_format_br(tel_novo_raw)
 
-            send_btn = st.button("📧 ENVIAR DADOS PARA O EMAIL CADASTRADO 📧", use_container_width=True)
-            if send_btn:
-                if not e_r.strip():
-                    st.error("Informe o e-mail cadastrado.")
-                elif not tel_is_valid_11(fmt_tel_rec):
-                    st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
-                else:
-                    tel_rec_digits = tel_only_digits(fmt_tel_rec)
-                    u_raw = buscar_user_by_email_tel(e_r.strip().lower(), tel_rec_digits)
-                    if not u_raw:
-                        st.error("Dados não encontrados (verifique e-mail e telefone).")
+                    grad_atual = str(u_ui.get("Graduação", "") or "")
+                    if grad_atual not in grad_opcoes:
+                        grad_atual = grad_opcoes[0]
+                    grad_nova = st.selectbox("Graduação:", grad_opcoes, index=grad_opcoes.index(grad_atual))
+
+                    lot_nova = st.text_input("Lotação:", value=str(u_ui.get("Lotação", "") or ""))
+
+                    orig_atual = str(u_ui.get("QG_RMCF_OUTROS", "") or "")
+                    if orig_atual not in origem_opcoes:
+                        orig_atual = origem_opcoes[0]
+                    orig_nova = st.selectbox("Origem:", origem_opcoes, index=origem_opcoes.index(orig_atual))
+
+                    st.caption("Se não quiser trocar a senha, deixe em branco.")
+                    senha1 = st.text_input("Nova senha:", type="password")
+                    senha2 = st.text_input("Confirmar nova senha:", type="password")
+
+                    salvar = st.form_submit_button("💾 SALVAR ALTERAÇÕES", use_container_width=True)
+
+                if salvar:
+                    if not str(nome_novo or "").strip():
+                        st.error("Informe o Nome de Escala.")
+                    elif not tel_is_valid_11(tel_novo_fmt):
+                        st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
+                    elif not str(lot_nova or "").strip():
+                        st.error("Informe a Lotação.")
+                    elif (senha1 or senha2) and (senha1 != senha2):
+                        st.error("As senhas não conferem.")
                     else:
                         try:
-                            enviar_dados_cadastrais_para_email(u_raw)
-                            st.success("✅ Enviado para o e-mail cadastrado.")
-                            st.info("Se não chegar, verifique SPAM/Lixo eletrônico e confirme as credenciais SMTP no Secrets.")
+                            uid = st.session_state.get("_edit_user_id")
+                            if not uid:
+                                st.error("Não foi possível identificar o usuário para edição.")
+                            else:
+                                payload = {
+                                    "nome": str(nome_novo).strip(),
+                                    "telefone": tel_only_digits(tel_novo_fmt),
+                                    "graduacao": str(grad_nova).strip(),
+                                    "lotacao": str(lot_nova).strip(),
+                                    "origem": str(orig_nova).strip(),
+                                    # limpa temporária (garante que não fique pendência)
+                                    "temp_senha": None,
+                                    "temp_expira": None,
+                                    "temp_usada": True,
+                                }
+                                if str(senha1 or "").strip():
+                                    payload["senha"] = str(senha1)
+
+                                usuarios_update(uid, payload)
+
+                                st.success("✅ Cadastro atualizado.")
+                                st.session_state._edit_cadastro = False
+                                st.session_state._edit_user_id = None
+                                st.session_state._edit_user_ui = None
+                                st.rerun()
                         except Exception as ex:
-                            st.error(f"Falha ao enviar e-mail: {ex}")
-        # ADM LOGIN
-        # -------------------------
+                            st.error(f"Falha ao atualizar cadastro: {ex}")
+
+
         with t5:
             with st.form("form_admin"):
                 ad_u = st.text_input("Usuário ADM:")
