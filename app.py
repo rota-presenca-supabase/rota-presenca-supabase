@@ -1327,6 +1327,7 @@ try:
 
             c1, c2 = st.columns(2)
             with c1:
+                insc = int(df_o.shape[0]) if df_o is not None else 0
                 resumo = {"inscritos": insc, "vagas": 38}
                 pdf_bytes = gerar_pdf_apresentado(df_o, resumo)
                 _ = st.download_button(
