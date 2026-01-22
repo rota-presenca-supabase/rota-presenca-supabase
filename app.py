@@ -181,46 +181,51 @@ def enviar_email(destinatario: str, assunto: str, corpo: str):
         server.login(cfg["user"], cfg["pwd"])
         server.send_message(msg)
 
-def enviar_dados_cadastrais_para_email(u: dict):
-    email_dest = (u or {}).get("email")
-    if not email_dest:
+def enviar_dados_cadastrais_para_email(u_any: dict):
+    """Envia os dados cadastrais para o e-mail do próprio usuário.
+
+    Aceita tanto o "row" vindo do banco (chaves minúsculas) quanto o dict de UI (ex: 'Email').
+    """
+    # pega e-mail independente de como veio o dict
+    email = (
+        (u_any or {}).get("email")
+        or (u_any or {}).get("Email")
+        or (u_any or {}).get("E-mail")
+        or (u_any or {}).get("e-mail")
+    )
+    if not email:
         raise ValueError("Usuário sem email cadastrado.")
 
-    campos = [
-        ("Nome", u.get("nome") or ""),
-        ("Email", u.get("email") or ""),
-        ("Telefone", u.get("telefone") or ""),
-        ("Graduação", u.get("graduacao") or ""),
-        ("Lotação", u.get("lotacao") or ""),
-        ("Origem", u.get("origem") or ""),
+    nome = (
+        (u_any or {}).get("nome")
+        or (u_any or {}).get("Nome")
+        or (u_any or {}).get("Nome de Escala")
+        or "(sem nome)"
+    )
+
+    # Monta corpo de forma robusta (tanto UI quanto DB)
+    def pick(*ks):
+        for k in ks:
+            if (u_any or {}).get(k) not in (None, ""):
+                return (u_any or {}).get(k)
+        return ""
+
+    corpo = [
+        f"Olá, {nome}.",
+        "",
+        "Segue abaixo o seu cadastro completo:",
+        "",
+        f"Nome de Escala: {pick('nome','Nome','Nome de Escala')}",
+        f"E-mail: {email}",
+        f"Telefone: {pick('telefone','Telefone')}",
+        f"Graduação: {pick('graduacao','Graduação')}",
+        f"Lotação: {pick('lotacao','Lotação')}",
+        f"Origem: {pick('origem','Origem')}",
+        "",
+        "(Este e-mail foi enviado automaticamente pelo sistema.)",
     ]
-    # Extras comuns (se existirem)
-    if u.get("created_at"):
-        campos.append(("Criado em", str(u.get("created_at"))))
-    if u.get("updated_at"):
-        campos.append(("Atualizado em", str(u.get("updated_at"))))
-
-    linhas = [
-        "Olá!",
-        "",
-        "Segue abaixo uma cópia dos seus dados cadastrais no sistema Rota Presença:",
-        "",
-    ]
-    for k, v in campos:
-        linhas.append(f"- {k}: {v}")
-    linhas += [
-        "",
-        "Se algum dado estiver incorreto, use o menu RECUPERAR para gerar uma senha temporária e ajustar o cadastro.",
-        "",
-        "Mensagem automática.",
-    ]
-    enviar_email(email_dest, "Seus dados cadastrais - Rota Presença", "\n".join(linhas))
-
-
-
-# ==========================================================
-# DB HELPERS
-# ==========================================================
+    assunto = "Seus dados cadastrais - Rota Nova Iguaçu"
+    enviar_email(email, assunto, "\n".join(corpo))
 def usuarios_select(where=None, columns="*"):
     q = sb().table(TB_USUARIOS).select(columns)
     if where:
