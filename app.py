@@ -1318,7 +1318,7 @@ try:
 
             if st.session_state.conf_ativa and len(dados_p_show) > 1:
                 for i, row in df_o.iterrows():
-                    label = f"{row.get('Nº','')} - {row.get('NOME','')}".strip()
+                    label = f"{row.get('Nº','')} - {row.get('GRADUAÇÃO','')} {row.get('NOME','')} - {row.get('LOTAÇÃO','')}".strip()
                     _ = st.checkbox(label if label else " ", key=f"chk_p_{i}")
 
         if len(dados_p_show) > 1:
@@ -1375,3 +1375,4 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Erro: {e}")
+
