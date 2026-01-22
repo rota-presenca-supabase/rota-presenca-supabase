@@ -363,6 +363,31 @@ def presenca_delete(where: dict = None):
     res = sb_call(q.execute)
     return res.data
 
+def presenca_exists(usuario_id: str, ciclo_data: str, ciclo_hora: str) -> bool:
+    try:
+        r = sb().table(TB_PRESENCA).select("id").eq("usuario_id", usuario_id).eq("ciclo_data", ciclo_data).eq("ciclo_hora", ciclo_hora).limit(1).execute()
+        data = getattr(r, "data", None) or []
+        return len(data) > 0
+    except Exception:
+        return False
+
+
+def limpar_presencas_de_outros_ciclos(ciclo_data: str, ciclo_hora: str) -> None:
+    """Mantém a tabela presencas 'limpa' para o ciclo atual.
+    Remove registros de ciclos anteriores (ciclo_data/ciclo_hora diferentes do atual).
+    """
+    try:
+        # PostgREST OR: campo.op.valor
+        filtro = f"ciclo_data.neq.{ciclo_data},ciclo_hora.neq.{ciclo_hora}"
+        sb().table(TB_PRESENCA).delete().or_(filtro).execute()
+    except Exception:
+        # Se a API não aceitar OR, não quebra o app (apenas não limpa)
+        pass
+
+
+def presenca_delete_usuario_ciclo(usuario_id: str, ciclo_data: str, ciclo_hora: str) -> None:
+    sb().table(TB_PRESENCA).delete().eq("usuario_id", usuario_id).eq("ciclo_data", ciclo_data).eq("ciclo_hora", ciclo_hora).execute()
+
 def config_get_int(key: str, default: int = 100) -> int:
     try:
         res = sb_call(sb().table(TB_CONFIG).select("value").eq("key", key).limit(1).execute)
@@ -1265,32 +1290,37 @@ try:
                 str(r.get("email", "") or "").lower()
             ])
 
-        aberto, janela_conf = verificar_status_e_limpar_db(presencas_raw)
+            # --- ciclo atual (data/hora) ---
+            ciclo_hora, ciclo_data_br = obter_ciclo_atual()
+            try:
+                ciclo_data = datetime.strptime(ciclo_data_br, "%d/%m/%Y").date().isoformat()
+            except Exception:
+                ciclo_data = ciclo_data_br
 
-        df_o, df_v = pd.DataFrame(), pd.DataFrame()
-        ja, pos = False, 999
+            # Mantém o BD limpo para o ciclo atual (remove registros antigos)
+            if st.session_state.get("_ciclo_limpeza") != (ciclo_data, ciclo_hora):
+                limpar_presencas_de_outros_ciclos(ciclo_data, ciclo_hora)
+                st.session_state["_ciclo_limpeza"] = (ciclo_data, ciclo_hora)
 
-        if len(dados_p_show) > 1:
-            df_o, df_v = aplicar_ordenacao(pd.DataFrame(dados_p_show[1:], columns=dados_p_show[0]))
-            email_logado = str(u.get("Email")).strip().lower()
-            ja = any(email_logado == str(row.get("EMAIL", "")).strip().lower() for _, row in df_o.iterrows())
+            usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
+
+            # Se já existe presença do usuário neste ciclo, mostra opção de excluir
+            ja = False
+            if usuario_id_logado:
+                ja = presenca_exists(usuario_id_logado, ciclo_data, ciclo_hora)
+
             if ja:
                 st.warning("⚠️ Você já confirmou sua presença neste ciclo.")
                 exc_btn = st.button("🚫 EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_minha_presenca")
                 if exc_btn:
                     try:
-                        presenca_delete(email=email_logado, data=ciclo_data, hora=ciclo_hora)
-                        st.success("✅ Presença excluída.")
+                        presenca_delete_usuario_ciclo(usuario_id_logado, ciclo_data, ciclo_hora)
+                        st.success("✅ Sua presença foi excluída deste ciclo.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao excluir presença: {e}")
 
-            elif aberto:
-                # --- IDs e ciclo (evita NameError) ---
-                usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
-                ciclo_data = ciclo_d
-                ciclo_hora = ciclo_h
-
+            elif aberto and usuario_id_logado:
                 salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_presenca")
                 if salvar_btn:
                     try:
@@ -1300,6 +1330,8 @@ try:
                             "graduacao": graduacao_logado,
                             "lotacao": lotacao_logado,
                             "origem": origem_logado,
+                            "ciclo_data": ciclo_data,
+                            "ciclo_hora": ciclo_hora,
                             "data": ciclo_data,
                             "hora": ciclo_hora,
                             "data_hora": datetime.now(pytz.UTC).isoformat(),
