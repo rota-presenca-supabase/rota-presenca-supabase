@@ -934,7 +934,7 @@ try:
                                 if str(senha1 or "").strip():
                                     payload["senha"] = str(senha1)
 
-                                usuarios_update(uid, payload)
+                                usuarios_update({"id": uid}, payload)
 
                                 st.success("✅ Cadastro atualizado.")
                                 st.session_state._edit_cadastro = False
