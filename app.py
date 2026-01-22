@@ -617,6 +617,10 @@ def user_to_ui_dict(u: dict) -> dict:
         "id": u.get("id")
     }
 
+# Alias por compatibilidade (código antigo usava esse nome)
+map_user_row = user_to_ui_dict
+
+
 def _senha_temp_valida(u_dict):
     temp = str(u_dict.get("TEMP_SENHA", "") or "").strip()
     usada = u_dict.get("TEMP_USADA", None)
