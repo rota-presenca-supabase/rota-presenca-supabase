@@ -284,6 +284,51 @@ def marcar_recuperacao_dados(user_id: str):
         # Se falhar, não bloqueia o usuário (apenas não registra o limite)
         pass
 
+def try_acquire_recuperacao_token(user_id: str):
+    """Garante no máximo 1 envio de dados por dia (fuso America/Sao_Paulo).
+    Retorna (ok, prev_value, new_value, next_allowed_dt).
+    """
+    tz = pytz.timezone("America/Sao_Paulo")
+    now = datetime.now(tz)
+    start_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    now_utc = now.astimezone(pytz.utc)
+    start_day_utc = start_day.astimezone(pytz.utc)
+    next_allowed = start_day + timedelta(days=1)
+
+    # Busca valor atual (para rollback caso o e-mail falhe)
+    prev = None
+    try:
+        r = sb().table("usuarios").select("last_recuperacao_dados_at").eq("id", user_id).limit(1).execute()
+        if r.data and isinstance(r.data, list) and len(r.data) > 0:
+            prev = r.data[0].get("last_recuperacao_dados_at")
+    except Exception:
+        prev = None
+
+    # UPDATE condicional (só atualiza se ainda não recuperou hoje)
+    cond = f"last_recuperacao_dados_at.is.null,last_recuperacao_dados_at.lt.{start_day_utc.isoformat()}"
+    try:
+        upd = (
+            sb()
+            .table("usuarios")
+            .update({"last_recuperacao_dados_at": now_utc.isoformat()})
+            .eq("id", user_id)
+            .or_(cond)
+            .execute()
+        )
+        ok = bool(upd.data) and isinstance(upd.data, list) and len(upd.data) > 0
+        return ok, prev, now_utc.isoformat(), next_allowed
+    except Exception:
+        return False, prev, now_utc.isoformat(), next_allowed
+
+
+def rollback_recuperacao_token(user_id: str, prev_value):
+    """Se o envio do e-mail falhar, tenta restaurar o timestamp anterior."""
+    try:
+        sb().table("usuarios").update({"last_recuperacao_dados_at": prev_value}).eq("id", user_id).execute()
+    except Exception:
+        pass
+
 def usuarios_insert(row: dict):
     res = sb_call(sb().table(TB_USUARIOS).insert, row).execute()
     return res.data
@@ -914,16 +959,17 @@ try:
             if btn_email:
                 uid, u_raw, u_ui = _validar_email_senha()
                 if uid and u_ui:
-                    ok, next_allowed = pode_recuperar_dados_hoje(u_raw)
+                    ok, prev_value, new_value, next_allowed = try_acquire_recuperacao_token(uid)
                     if not ok:
                         when_txt = next_allowed.strftime("%d/%m/%Y %H:%M") if next_allowed else "amanhã"
                         st.warning(f"⚠️ Você já recuperou seus dados hoje. Tente novamente {when_txt}.")
                     else:
                         try:
                             enviar_dados_cadastrais_para_email(u_ui)
-                            marcar_recuperacao_dados(uid)
                             st.success("✅ Dados enviados para o e-mail cadastrado.")
                         except Exception as ex:
+                            # Se falhar o e-mail, desfaz o bloqueio do dia (rollback)
+                            rollback_recuperacao_token(uid, prev_value)
                             st.error(f"Falha ao enviar e-mail: {ex}")
 
             # 2) EDITAR CADASTRO (substitui o 'Gerar senha temporária')
