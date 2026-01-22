@@ -1286,10 +1286,10 @@ try:
                         st.error(f"Falha ao excluir presença: {e}")
 
             elif aberto:
-# --- IDs e ciclo (evita NameError) ---
-usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
-ciclo_data = ciclo_d
-ciclo_hora = ciclo_h
+                # --- IDs e ciclo (evita NameError) ---
+                usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
+                ciclo_data = ciclo_d
+                ciclo_hora = ciclo_h
 
                 salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_presenca")
                 if salvar_btn:
@@ -1366,9 +1366,4 @@ ciclo_hora = ciclo_h
     )
 
 except Exception as e:
-# --- IDs e ciclo (evita NameError) ---
-usuario_id_logado = (st.session_state.get("usuario_logado") or {}).get("id")
-ciclo_data = ciclo_d
-ciclo_hora = ciclo_h
-
     st.error(f"⚠️ Erro: {e}")
