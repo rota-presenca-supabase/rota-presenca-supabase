@@ -363,31 +363,6 @@ def presenca_delete(where: dict = None):
     res = sb_call(q.execute)
     return res.data
 
-def presenca_exists(usuario_id: str, ciclo_data: str, ciclo_hora: str) -> bool:
-    try:
-        r = sb().table(TB_PRESENCA).select("id").eq("usuario_id", usuario_id).eq("ciclo_data", ciclo_data).eq("ciclo_hora", ciclo_hora).limit(1).execute()
-        data = getattr(r, "data", None) or []
-        return len(data) > 0
-    except Exception:
-        return False
-
-
-def limpar_presencas_de_outros_ciclos(ciclo_data: str, ciclo_hora: str) -> None:
-    """Mantém a tabela presencas 'limpa' para o ciclo atual.
-    Remove registros de ciclos anteriores (ciclo_data/ciclo_hora diferentes do atual).
-    """
-    try:
-        # PostgREST OR: campo.op.valor
-        filtro = f"ciclo_data.neq.{ciclo_data},ciclo_hora.neq.{ciclo_hora}"
-        sb().table(TB_PRESENCA).delete().or_(filtro).execute()
-    except Exception:
-        # Se a API não aceitar OR, não quebra o app (apenas não limpa)
-        pass
-
-
-def presenca_delete_usuario_ciclo(usuario_id: str, ciclo_data: str, ciclo_hora: str) -> None:
-    sb().table(TB_PRESENCA).delete().eq("usuario_id", usuario_id).eq("ciclo_data", ciclo_data).eq("ciclo_hora", ciclo_hora).execute()
-
 def config_get_int(key: str, default: int = 100) -> int:
     try:
         res = sb_call(sb().table(TB_CONFIG).select("value").eq("key", key).limit(1).execute)
@@ -433,16 +408,14 @@ def buscar_user_by_email_senha(email: str, senha: str):
 @st.cache_data(ttl=30)
 def buscar_usuarios_cadastrados():
     try:
-        rows = usuarios_select()
-        return [map_user_row(r) for r in rows]
+        return usuarios_select()
     except Exception:
         return []
 
 @st.cache_data(ttl=3)
 def buscar_usuarios_admin():
     try:
-        rows = usuarios_select()
-        return [map_user_row(r) for r in rows]
+        return usuarios_select()
     except Exception:
         return []
 
@@ -453,80 +426,63 @@ def buscar_limite_dinamico():
 @st.cache_data(ttl=6)
 def buscar_presenca_atualizada():
     try:
-        rows = presenca_select()
-        return [map_presenca_row(r) for r in (rows or [])]
+        return presenca_select()
     except Exception:
         return []
 
+# ==========================================================
+# PRESENÇA: limpeza por ciclo (equivalente ao resize do Sheets)
+# ==========================================================
 def verificar_status_e_limpar_db(presencas_rows):
-    """Retorna (is_aberto, janela_conferencia).
-
-    Também faz a 'limpeza por marco' para não carregar presenças antigas quando muda o ciclo.
-    - Marco 06:50 e 18:50 (horário de Brasília).
-    - Se existir presença mais recente anterior ao marco atual, zera a tabela.
-    """
     agora = _br_now()
-    hora_atual = agora.time()
+    hora_atual, dia_semana = agora.time(), agora.weekday()
 
-    # Define o marco (início do ciclo "atual") em horário BR
     if hora_atual >= time(18, 50):
         marco = agora.replace(hour=18, minute=50, second=0, microsecond=0)
     elif hora_atual >= time(6, 50):
         marco = agora.replace(hour=6, minute=50, second=0, microsecond=0)
     else:
-        # antes de 06:50 -> ainda é o ciclo iniciado ontem 18:50
         marco = (agora - timedelta(days=1)).replace(hour=18, minute=50, second=0, microsecond=0)
 
-    # 1) Limpeza automática (se houver presenças mais antigas que o marco atual)
+    # se a última presença for anterior ao marco, zera tabela
     if presencas_rows:
         try:
-            from dateutil import parser as _dtparser
-            ultima_dt = None
-            for r in presencas_rows or []:
-                dh = r.get("data_hora")
-                if not dh:
-                    continue
-                try:
-                    dt_obj = _dtparser.isoparse(dh) if isinstance(dh, str) else dh
-                except Exception:
-                    continue
-                if dt_obj is None:
-                    continue
-                if dt_obj.tzinfo is None:
-                    dt_obj = dt_obj.replace(tzinfo=pytz.utc)
-                if (ultima_dt is None) or (dt_obj > ultima_dt):
-                    ultima_dt = dt_obj
+            # pega a mais recente
+            last = max(presencas_rows, key=lambda r: str(r.get("data_hora", "")) or "")
+            last_dt = pd.to_datetime(last.get("data_hora"), errors="coerce")
+            if pd.notna(last_dt):
+                # converte pra fuso
+                if last_dt.tzinfo is None:
+                    last_dt = FUSO_BR.localize(last_dt.to_pydatetime())
+                else:
+                    last_dt = last_dt.tz_convert(FUSO_BR).to_pydatetime()
 
-            if ultima_dt is not None:
-                ultima_dt_br = ultima_dt.astimezone(_BR_TZ)
-                # se a última presença é anterior ao marco do ciclo atual, zera
-                if ultima_dt_br < marco:
-                    try:
-                        supabase.table("presencas").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-                    except Exception:
-                        # não derruba o app por falha de limpeza
-                        pass
+                if last_dt < marco:
+                    presenca_delete()  # deleta tudo
+                    st.session_state["_force_refresh_presenca"] = True
+                    st.rerun()
         except Exception:
             pass
 
-    # 2) Status de janela aberta/fechada e janela de conferência
-    # Regra: abre 06:30-07:00 (embarque manhã) e 18:30-19:00 (embarque tarde)
-    is_aberto = False
-    janela_conferencia = False
-
-    if time(6, 30) <= hora_atual <= time(7, 0):
-        is_aberto = True
-    elif time(18, 30) <= hora_atual <= time(19, 0):
-        is_aberto = True
-    else:
+    # Regras de abertura/fechamento (idênticas)
+    if dia_semana == 5:  # Sábado
         is_aberto = False
+    elif dia_semana == 6:  # Domingo
+        is_aberto = (hora_atual >= time(19, 0))
+    elif dia_semana == 4:  # Sexta
+        if hora_atual >= time(17, 0):
+            is_aberto = False
+        elif time(5, 0) <= hora_atual < time(7, 0):
+            is_aberto = False
+        else:
+            is_aberto = True
+    else:  # Segunda a Quinta
+        if (time(5, 0) <= hora_atual < time(7, 0)) or (time(17, 0) <= hora_atual < time(19, 0)):
+            is_aberto = False
+        else:
+            is_aberto = True
 
-    # Janela de conferência: 07:00-07:10 e 19:00-19:10
-    if time(7, 0) <= hora_atual <= time(7, 10):
-        janela_conferencia = True
-    elif time(19, 0) <= hora_atual <= time(19, 10):
-        janela_conferencia = True
-
+    janela_conferencia = (time(5, 0) < hora_atual < time(7, 0)) or (time(17, 0) < hora_atual < time(19, 0))
     return is_aberto, janela_conferencia
 
 # ==========================================================
@@ -745,137 +701,25 @@ def email_basic_ok(e: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(e or "").strip()))
 
 def user_to_ui_dict(u: dict) -> dict:
-    """Normaliza o row do usuário para chaves que o app usa (e evita None no UI)."""
-    if not u:
-        return {}
-
-    email = (_get_any(u, ["email", "Email", "E-mail", "E-mail cadastrado", "e_mail"], "") or "").strip().lower()
-    nome = _get_any(u, ["nome", "nome_escala", "nomeEscala", "Nome de Escala", "Nome", "nome_de_escala"], "")
-    telefone = _get_any(u, ["telefone", "tel", "Telefone", "phone"], "")
-    graduacao = _get_any(u, ["graduacao", "Graduacao", "Graduação", "GRADUAÇÃO"], "")
-    lotacao = _get_any(u, ["lotacao", "Lotacao", "Lotação", "LOTAÇÃO"], "")
-    origem = _get_any(u, ["origem", "qg_rmcf_outros", "QG_RMCF_OUTROS", "QG"], "")
-    status = (_get_any(u, ["status", "STATUS"], "") or "").strip().upper()
-
-    # no app atual a senha é texto no BD (coluna 'senha')
-    senha = _get_any(u, ["senha", "Senha", "SENHA"], "")
-
-    ui = {
-        # canônicas
-        "id": _get_any(u, ["id", "ID"], None),
-        "nome_escala": nome or email,
-        "graduacao": graduacao,
-        "lotacao": lotacao,
-        "origem": origem,
-        "senha": senha,
-        "email": email,
-        "status": status,
-        "telefone": telefone,
-        "last_recuperacao_dados_at": _get_any(u, ["last_recuperacao_dados_at", "Last_recuperacao_dados_at", "LAST_RECUPERACAO_DADOS_AT"], None),
+    # padroniza chaves (compat com código do Sheets)
+    return {
+        "Nome": u.get("nome") or u.get("Nome") or "",
+        "Graduação": u.get("graduacao") or u.get("Graduação") or "",
+        "Lotação": u.get("lotacao") or u.get("Lotação") or "",
+        "Senha": u.get("senha") or u.get("Senha") or "",
+        "QG_RMCF_OUTROS": u.get("origem") or u.get("QG_RMCF_OUTROS") or u.get("ORIGEM") or "",
+        "Email": u.get("email") or u.get("Email") or "",
+        "TELEFONE": u.get("telefone") or u.get("TELEFONE") or "",
+        "STATUS": u.get("status") or u.get("STATUS") or "PENDENTE",
+        "TEMP_SENHA": u.get("temp_senha") or "",
+        "TEMP_EXPIRA": u.get("temp_expira") or "",
+        "TEMP_USADA": u.get("temp_usada") if u.get("temp_usada") is not None else "",
+        "id": u.get("id")
     }
 
-    # compatibilidade: chaves antigas usadas em algumas telas
-    ui.update({
-        "Nome": ui["nome_escala"],
-        "Nome de Escala": ui["nome_escala"],
-        "Email": ui["email"],
-        "E-mail": ui["email"],
-        "Telefone": ui["telefone"],
-        "Graduação": ui["graduacao"],
-        "Lotação": ui["lotacao"],
-        "Origem": ui["origem"],
-        "STATUS": ui["status"],
-        "Senha": ui["senha"],
-    })
+# Alias por compatibilidade (código antigo usava esse nome)
+map_user_row = user_to_ui_dict
 
-    return ui
-def _pick(row, *keys, default=None):
-    """Retorna o primeiro valor não-vazio encontrado em 'row' para qualquer uma das chaves informadas.
-    Também tenta variações em maiúsculo/minúsculo automaticamente.
-    """
-    if row is None:
-        return default
-    for k in keys:
-        if k in row and row.get(k) not in (None, ""):
-            return row.get(k)
-        ku = k.upper()
-        kl = k.lower()
-        if ku in row and row.get(ku) not in (None, ""):
-            return row.get(ku)
-        if kl in row and row.get(kl) not in (None, ""):
-            return row.get(kl)
-    return default
-
-def map_user_row(row: dict) -> dict:
-    """Normaliza um registro vindo do Supabase para o formato UI (chaves com acento)."""
-    if not isinstance(row, dict):
-        return {}
-
-    def pick(*keys, default=None):
-        for k in keys:
-            if k in row and row.get(k) is not None:
-                return row.get(k)
-        return default
-
-    raw = {
-        "id": pick("id", "ID"),
-        "email": pick("email", "Email", "e_mail"),
-        "telefone": pick("telefone", "Telefone", "tel", "celular"),
-        "senha": pick("senha", "Senha", "password"),
-        "nome_escala": pick("nome_escala", "nome", "Nome de Escala"),
-        "graduacao": pick("graduacao", "Graduação", "grad"),
-        "lotacao": pick("lotacao", "Lotação", "lot"),
-        "origem": pick("origem", "Origem", "qg_rmcf_outros", "qg"),
-        "status": pick("status", "STATUS", default="PENDENTE"),
-        "created_at": pick("created_at"),
-        "updated_at": pick("updated_at"),
-        "last_recuperacao_dados_at": pick("last_recuperacao_dados_at"),
-    }
-    return user_to_ui_dict(raw)
-
-def _get_any(d: dict, keys, default=None):
-    """Retorna o primeiro valor não-nulo / não-vazio dentre as chaves informadas."""
-    for k in keys:
-        if not k:
-            continue
-        v = d.get(k, None) if isinstance(d, dict) else None
-        if v is None:
-            continue
-        if isinstance(v, str) and v.strip() == "":
-            continue
-        return v
-    return default
-
-def map_presenca_row(row: dict) -> dict:
-    """Normaliza uma linha de 'presencas' para chaves usadas no app (inclusive legado)."""
-    r = row or {}
-    data_hora = _get_any(r, ["data_hora", "DATA_HORA", "dataHora", "created_at"], "")
-    qg_rmcf_outros = _get_any(r, ["qg_rmcf_outros", "QG_RMCF_OUTROS", "origem"], "")
-    graduacao = _get_any(r, ["graduacao", "GRADUAÇÃO", "graduacao_txt"], "")
-    nome = _get_any(r, ["nome", "NOME", "nome_escala", "Nome de Escala", "Nome"], "")
-    lotacao = _get_any(r, ["lotacao", "LOTAÇÃO", "lotacao_txt"], "")
-
-    # Mantém o id do usuário para operações (confirmar/excluir)
-    usuario_id = _get_any(r, ["usuario_id", "USUARIO_ID", "user_id"], None)
-    presenca_id = _get_any(r, ["id", "ID"], None)
-
-    out = {
-        "id": presenca_id,
-        "usuario_id": usuario_id,
-        "data_hora": data_hora,
-        "qg_rmcf_outros": qg_rmcf_outros,
-        "graduacao": graduacao,
-        "nome": nome,
-        "lotacao": lotacao,
-
-        # chaves legadas usadas em dataframes/telas
-        "DATA_HORA": data_hora,
-        "QG_RMCF_OUTROS": qg_rmcf_outros,
-        "GRADUAÇÃO": graduacao,
-        "NOME": nome,
-        "LOTAÇÃO": lotacao,
-    }
-    return out
 
 def _senha_temp_valida(u_dict):
     temp = str(u_dict.get("TEMP_SENHA", "") or "").strip()
@@ -910,22 +754,11 @@ def _senha_temp_valida(u_dict):
     return _br_now() <= exp_dt
 
 def _senha_confere(u_dict, senha_digitada: str):
-    """Confere senha real e (opcional) senha temporária.
-    Retorna (tipo, ok) onde tipo é 'REAL' ou 'TEMP'.
-    """
     senha_digitada = str(senha_digitada or "").strip()
-
-    # senha "real" (coluna atual)
-    senha_real = str(u_dict.get("senha") or u_dict.get("Senha") or "").strip()
-    if senha_real and senha_real == senha_digitada:
+    if str(u_dict.get("Senha", "")).strip() == senha_digitada:
         return ("REAL", True)
-
-    # senha temporária (se existir no schema)
-    # aceita nomes antigos/novos para compatibilidade
-    temp_senha = str(u_dict.get("temp_senha") or u_dict.get("TEMP_SENHA") or "").strip()
-    if temp_senha and temp_senha == senha_digitada and _senha_temp_valida(u_dict):
+    if _senha_temp_valida(u_dict) and str(u_dict.get("TEMP_SENHA", "")).strip() == senha_digitada:
         return ("TEMP", True)
-
     return ("", False)
 
 def buscar_user_by_email_tel(email: str, tel_digits: str):
@@ -1063,8 +896,7 @@ try:
                                     "status": "PENDENTE",
                                     "temp_senha": "",
                                     "temp_expira": None,
-                                    "temp_usada": True,
-                                    "last_recuperacao_dados_at": None
+                                    "temp_usada": True
                                 })
                                 buscar_usuarios_cadastrados.clear()
                                 buscar_usuarios_admin.clear()
@@ -1407,111 +1239,79 @@ try:
         if st.session_state._force_refresh_presenca:
             buscar_presenca_atualizada.clear()
             st.session_state._force_refresh_presenca = False
-        # Defaults (evita NameError se algo falhar no meio)
-        presencas_raw = []
-        aberto = False
-        janela_conferencia = False
-        usuario_id_logado = None
-        ciclo_data = None
-        ciclo_data_iso = None
-        ciclo_hora = None
-        turno_atual = None
 
         presencas_raw = buscar_presenca_atualizada()
-        # === Ciclo atual (data/hora) ===
-        ciclo_hora, ciclo_data_br = obter_ciclo_atual()
-        try:
-            ciclo_data_iso = ciclo_data_br.strftime("%Y-%m-%d")
-        except Exception:
-            ciclo_data_iso = str(ciclo_data_br)
 
-        ciclo_key = f"{ciclo_data_iso}_{ciclo_hora}"
+        # monta "planilha" para reaproveitar a mesma UI
+        dados_p_show = [["DATA_HORA", "QG_RMCF_OUTROS", "GRADUAÇÃO", "NOME", "LOTAÇÃO", "EMAIL"]]
+        for r in presencas_raw:
+            dt = pd.to_datetime(r.get("data_hora"), errors="coerce")
+            if pd.isna(dt):
+                # fallback: usa string
+                dt_str = str(r.get("data_hora", ""))
+            else:
+                if dt.tzinfo is None:
+                    dt = FUSO_BR.localize(dt.to_pydatetime())
+                else:
+                    dt = dt.tz_convert(FUSO_BR).to_pydatetime()
+                dt_str = dt.strftime("%d/%m/%Y %H:%M:%S")
+            dados_p_show.append([
+                dt_str,
+                str(r.get("origem", "") or "QG"),
+                str(r.get("graduacao", "") or ""),
+                str(r.get("nome", "") or ""),
+                str(r.get("lotacao", "") or ""),
+                str(r.get("email", "") or "").lower()
+            ])
 
-        # Limpa automaticamente presenças de ciclos anteriores (1x por ciclo por sessão)
-        if st.session_state.get("_ciclo_limpeza_key") != ciclo_key:
-            try:
-                limpar_presencas_de_outros_ciclos(ciclo_hora, ciclo_data_iso)
-            finally:
-                st.session_state["_ciclo_limpeza_key"] = ciclo_key
-            presencas_raw = buscar_presenca_atualizada()
+        aberto, janela_conf = verificar_status_e_limpar_db(presencas_raw)
 
-        # Define se está aberto para novas confirmações + limpeza por marco (06:50/18:50)
-        aberto, janela_conferencia = verificar_status_e_limpar_db(presencas_raw)
+        df_o, df_v = pd.DataFrame(), pd.DataFrame()
+        ja, pos = False, 999
 
-        if not aberto:
-            st.info("⏳ Lista fechada para novas inscrições.")
-
-        # Dados do usuário logado
-        u_log = user_to_ui_dict(st.session_state.get("usuario_logado") or {})
-        usuario_id_logado = u_log.get("id")
-        nome_logado = u_log.get("nome_escala") or ""
-        graduacao_logado = u_log.get("graduacao") or ""
-        lotacao_logado = u_log.get("lotacao") or ""
-        origem_logado = u_log.get("origem") or "QG"
-        email_logado = u_log.get("email") or ""
-        telefone_logado = u_log.get("telefone") or ""
-
-        def _ja_confirmou_no_ciclo() -> bool:
-            if not usuario_id_logado:
-                return False
-            for rr in presencas_raw or []:
-                try:
-                    if rr.get("usuario_id") != usuario_id_logado:
-                        continue
-                    if str(rr.get("ciclo_hora")) != str(ciclo_hora):
-                        continue
-                    if str(rr.get("ciclo_data")) != str(ciclo_data_iso):
-                        continue
-                    return True
-                except Exception:
-                    pass
-            return False
-
-        ja_confirmou = _ja_confirmou_no_ciclo()
-
-        # Ação principal: confirmar / excluir
-        if ja_confirmou:
-            st.warning("⚠️ Você já confirmou sua presença neste ciclo.")
-            if st.button("🚫 EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_minha_presenca"):
-                try:
-                    if not usuario_id_logado:
-                        raise Exception("Usuário não identificado (sessão). Faça login novamente.")
-                    supabase.table("presencas").delete() \
-                        .eq("usuario_id", usuario_id_logado) \
-                        .eq("ciclo_hora", str(ciclo_hora)) \
-                        .eq("ciclo_data", str(ciclo_data_iso)) \
-                        .execute()
-                    st.success("✅ Presença excluída.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Falha ao excluir presença: {e}")
-        else:
-            if aberto:
-                if st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_minha_presenca"):
+        if len(dados_p_show) > 1:
+            df_o, df_v = aplicar_ordenacao(pd.DataFrame(dados_p_show[1:], columns=dados_p_show[0]))
+            email_logado = str(u.get("Email")).strip().lower()
+            ja = any(email_logado == str(row.get("EMAIL", "")).strip().lower() for _, row in df_o.iterrows())
+            if ja:
+                st.warning("⚠️ Você já confirmou sua presença neste ciclo.")
+                exc_btn = st.button("🚫 EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_minha_presenca")
+                if exc_btn:
                     try:
-                        if not usuario_id_logado:
-                            raise Exception("Usuário não identificado (sessão). Faça login novamente.")
-                        payload = {
+                        presenca_delete(email=email_logado, data=ciclo_data, hora=ciclo_hora)
+                        st.success("✅ Presença excluída.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha ao excluir presença: {e}")
+
+            elif aberto:
+                salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_presenca")
+                if salvar_btn:
+                    try:
+                        presenca_insert({
                             "usuario_id": usuario_id_logado,
                             "nome": nome_logado,
                             "graduacao": graduacao_logado,
                             "lotacao": lotacao_logado,
-                            "qg_rmcf_outros": origem_logado,
+                            "origem": origem_logado,
+                            "data": ciclo_data,
+                            "hora": ciclo_hora,
+                            "data_hora": datetime.now(pytz.UTC).isoformat(),
                             "email": email_logado,
                             "telefone": telefone_logado,
-                            "ciclo_hora": str(ciclo_hora),
-                            "ciclo_data": str(ciclo_data_iso),
-                        }
-                        supabase.table("presencas").insert(payload).execute()
-                        st.success("✅ Presença confirmada!")
+                        })
+                        st.success("✅ Presença confirmada com sucesso.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao confirmar presença: {e}")
+
             else:
-                if janela_conferencia:
-                    st.warning(f"⏳ Lista fechada. {janela_conferencia}")
-                else:
-                    st.warning("⏳ Lista fechada no momento.")
+                st.info("⏳ Lista fechada para novas inscrições.")
+                up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_lista_fechada")
+                if up_btn_fechado:
+                    st.rerun()
+
+            c_up1, c_up2 = st.columns([1, 1])
             with c_up1:
                 up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_tabela")
                 if up_btn:
@@ -1527,7 +1327,6 @@ try:
 
             c1, c2 = st.columns(2)
             with c1:
-                insc = int(df_o.shape[0]) if df_o is not None else 0
                 resumo = {"inscritos": insc, "vagas": 38}
                 pdf_bytes = gerar_pdf_apresentado(df_o, resumo)
                 _ = st.download_button(
