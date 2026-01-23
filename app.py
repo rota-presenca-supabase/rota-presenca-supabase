@@ -299,7 +299,7 @@ def try_acquire_recuperacao_token(user_id: str):
     # Busca valor atual (para rollback caso o e-mail falhe)
     prev = None
     try:
-        r = sb().table("usuarios").select("last_recuperacao_dados_at").eq("id", user_id).limit(1).execute()
+        r = supabase_admin.table("usuarios").select("last_recuperacao_dados_at").eq("id", user_id).limit(1).execute()
         if r.data and isinstance(r.data, list) and len(r.data) > 0:
             prev = r.data[0].get("last_recuperacao_dados_at")
     except Exception:
@@ -309,7 +309,7 @@ def try_acquire_recuperacao_token(user_id: str):
     cond = f"last_recuperacao_dados_at.is.null,last_recuperacao_dados_at.lt.{start_day_utc.isoformat()}"
     try:
         upd = (
-            sb()
+            supabase_admin
             .table("usuarios")
             .update({"last_recuperacao_dados_at": now_utc.isoformat()})
             .eq("id", user_id)
@@ -325,7 +325,7 @@ def try_acquire_recuperacao_token(user_id: str):
 def rollback_recuperacao_token(user_id: str, prev_value):
     """Se o envio do e-mail falhar, tenta restaurar o timestamp anterior."""
     try:
-        sb().table("usuarios").update({"last_recuperacao_dados_at": prev_value}).eq("id", user_id).execute()
+        supabase_admin.table("usuarios").update({"last_recuperacao_dados_at": prev_value}).eq("id", user_id).execute()
     except Exception:
         pass
 
@@ -439,8 +439,9 @@ def buscar_usuarios_cadastrados():
 
 @st.cache_data(ttl=3)
 def buscar_usuarios_admin():
+    # Busca todos os campos para evitar incompatibilidade de schema
     try:
-        return usuarios_select()
+        return usuarios_select(columns="*")
     except Exception:
         return []
 
@@ -497,7 +498,7 @@ def verificar_status_e_limpar_db(presencas_rows):
             else:
                 last_dt_br = None
 
-            if last_dt_br and last_dt_br < proximo_marco_br:
+            if last_dt_br and last_dt_br < marco:
                 supabase.table("presencas").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
                 st.session_state["_presencas_limpo_em"] = datetime.now(tz)
                 st.rerun()
@@ -740,716 +741,56 @@ def email_basic_ok(e: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(e or "").strip()))
 
 def user_to_ui_dict(u: dict) -> dict:
-    """Normaliza o row do usuário para chaves que o app usa, cobrindo variações de coluna."""
-    if not u:
-        return {}
-
-    # variações possíveis vindas do banco / versões antigas
-    nome = u.get("nome") or u.get("nome_escala") or u.get("nomeEscala") or ""
-    origem = u.get("origem") or u.get("qg_rmcf_outros") or u.get("QG_RMCF_OUTROS") or ""
-    telefone = u.get("telefone") or u.get("tel") or u.get("Telefone") or ""
-
-    ui = {
-        "id": u.get("id"),
-        "nome_escala": nome,
-        "graduacao": u.get("graduacao") or u.get("Graduacao") or "",
-        "lotacao": u.get("lotacao") or u.get("Lotacao") or "",
-        "origem": origem,
-        # atenção: no seu app a senha está em texto no BD (coluna 'senha')
-        "senha": u.get("senha") or "",
-        "email": (u.get("email") or u.get("Email") or "").strip().lower(),
-        "telefone": telefone,
-        "last_recuperacao_dados_at": u.get("last_recuperacao_dados_at"),
-    }
-    return ui
-
-def map_user_row(user_row: dict) -> dict:
-    """Normaliza o registro do usuário (dict) para uso em e-mails/formulários."""
-    if not isinstance(user_row, dict):
-        return {}
-    return {
-        "nome": user_row.get("nome") or user_row.get("Nome") or "",
-        "email": user_row.get("email") or user_row.get("Email") or "",
-        "telefone": user_row.get("telefone") or user_row.get("Telefone") or "",
-        "graduacao": user_row.get("graduacao") or user_row.get("Graduação") or "",
-        "lotacao": user_row.get("lotacao") or user_row.get("Lotação") or "",
-        "origem": user_row.get("origem") or user_row.get("Origem") or "",
-        "senha": user_row.get("senha") or user_row.get("Senha") or "",
-    }
-
-def _senha_temp_valida(u_dict):
-    temp = str(u_dict.get("TEMP_SENHA", "") or "").strip()
-    usada = u_dict.get("TEMP_USADA", None)
-    exp = u_dict.get("TEMP_EXPIRA", "")
-
-    # temp_usada pode vir bool, str, None
-    if isinstance(usada, bool):
-        usada_ok = (usada is False)
-    else:
-        usada_ok = (str(usada or "").strip().upper() in ["NAO", "NÃO", "FALSE", "0", ""])
-    if not temp or not usada_ok:
-        return False
-
-    exp_dt = None
-    if isinstance(exp, str) and exp.strip():
-        exp_dt = _parse_dt(exp)
-    else:
-        # se vier timestamptz do postgres
-        try:
-            exp_dt_pd = pd.to_datetime(exp, errors="coerce")
-            if pd.notna(exp_dt_pd):
-                if exp_dt_pd.tzinfo is None:
-                    exp_dt = FUSO_BR.localize(exp_dt_pd.to_pydatetime())
-                else:
-                    exp_dt = exp_dt_pd.tz_convert(FUSO_BR).to_pydatetime()
-        except Exception:
-            exp_dt = None
-
-    if exp_dt is None:
-        return False
-    return _br_now() <= exp_dt
-
-def _senha_confere(u_dict, senha_digitada: str):
-    """Confere senha real e (opcional) senha temporária.
-    Retorna (tipo, ok) onde tipo é 'REAL' ou 'TEMP'.
     """
-    senha_digitada = str(senha_digitada or "").strip()
-
-    # senha "real" (coluna atual)
-    senha_real = str(u_dict.get("senha") or u_dict.get("Senha") or "").strip()
-    if senha_real and senha_real == senha_digitada:
-        return ("REAL", True)
-
-    # senha temporária (se existir no schema)
-    # aceita nomes antigos/novos para compatibilidade
-    temp_senha = str(u_dict.get("temp_senha") or u_dict.get("TEMP_SENHA") or "").strip()
-    if temp_senha and temp_senha == senha_digitada and _senha_temp_valida(u_dict):
-        return ("TEMP", True)
-
-    return ("", False)
-
-def buscar_user_by_email_tel(email: str, tel_digits: str):
-    email = str(email or "").strip().lower()
-    tel_digits = tel_only_digits(tel_digits)
-    data = usuarios_select({"email": email, "telefone": tel_digits})
-    if not data:
-        # alguns cadastros podem estar com telefone formatado; tenta comparar por "contém" (últimos 11)
-        data_all = usuarios_select({"email": email})
-        for u in data_all:
-            if tel_only_digits(u.get("telefone", "")) == tel_digits:
-                return u
-        return None
-    return data[0]
-
-# ==========================================================
-# APP
-# ==========================================================
-if "_edit_cadastro" not in st.session_state:
-    st.session_state._edit_cadastro = False
-if "_edit_user_id" not in st.session_state:
-    st.session_state._edit_user_id = None
-
-try:
-    records_u_public_raw = buscar_usuarios_cadastrados()
-    records_u_public = [user_to_ui_dict(u) for u in records_u_public_raw]
-    limite_max = buscar_limite_dinamico()
-
-    if st.session_state.usuario_logado is None and not st.session_state.is_admin:
-        t1, t2, t3, t4, t5 = st.tabs(["Login", "Cadastro", "Instruções", "Recuperar", "ADM"])
-
-        # -------------------------
-        # LOGIN
-        # -------------------------
-        with t1:
-            with st.form("form_login"):
-                l_e = st.text_input("E-mail:")
-                raw_tel_login = st.text_input("Telefone:", value=st.session_state._tel_login_fmt)
-                fmt_tel_login = tel_format_br(raw_tel_login)
-                st.session_state._tel_login_fmt = fmt_tel_login
-                l_s = st.text_input("Senha:", type="password")
-
-                entrou = st.form_submit_button("▶️ ENTRAR ◀️", use_container_width=True)
-                if entrou:
-                    if not tel_is_valid_11(fmt_tel_login):
-                        st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
-                    else:
-                        tel_login_digits = tel_only_digits(fmt_tel_login)
-                        email_login = l_e.strip().lower()
-
-                        # busca usuário no DB
-                        u_raw = buscar_user_by_email_tel(email_login, tel_login_digits)
-                        u_a = user_to_ui_dict(u_raw) if u_raw else None
-
-                        if u_a and _senha_confere(u_a, l_s)[1]:
-                            status_user = str(u_a.get("STATUS", "")).strip().upper()
-                            if status_user == "ATIVO":
-                                kind, ok = _senha_confere(u_a, l_s)
-                                st.session_state.usuario_logado = u_a
-                                st.session_state._login_kind = kind
-
-                                if kind == "TEMP":
-                                    # marca como usada e força troca de senha + edição de cadastro (exceto e-mail)
-                                    try:
-                                        usuarios_update({"id": u_raw["id"]}, {"temp_usada": True})
-                                        buscar_usuarios_cadastrados.clear()
-                                        buscar_usuarios_admin.clear()
-                                    except Exception:
-                                        pass
-                                    st.session_state._force_password_change = True
-                                    st.session_state._force_profile_edit = True
-
-                                st.rerun()
-                            else:
-                                st.error("Acesso negado. Aguardando aprovação do Administrador.")
-                        else:
-                            st.error("Dados incorretos.")
-
-        # -------------------------
-        # CADASTRO
-        # -------------------------
-        with t2:
-            if len(records_u_public) >= limite_max:
-                st.warning(f"⚠️ Limite de {limite_max} usuários atingido.")
-            else:
-                with st.form("form_novo_cadastro"):
-                    n_n = st.text_input("Nome de Escala:")
-                    n_e = st.text_input("E-mail:")
-
-                    raw_tel_cad = st.text_input("Telefone:", value=st.session_state._tel_cad_fmt)
-                    fmt_tel_cad = tel_format_br(raw_tel_cad)
-                    st.session_state._tel_cad_fmt = fmt_tel_cad
-
-                    n_g = st.selectbox("Graduação:", LISTA_GRAD)
-                    n_l = st.text_input("Lotação:")
-                    n_o = st.selectbox("Origem:", LISTA_ORIGEM)
-                    n_p = st.text_input("Senha:", type="password")
-
-                    cadastrou = st.form_submit_button("✍️ SALVAR CADASTRO 👈", use_container_width=True)
-                    if cadastrou:
-                        missing = []
-                        if not norm_str(n_n): missing.append("Nome de Escala")
-                        if not norm_str(n_e): missing.append("E-mail")
-                        if norm_str(n_e) and not email_basic_ok(n_e): missing.append("E-mail (formato inválido)")
-                        if not tel_is_valid_11(fmt_tel_cad): missing.append("Telefone (inválido)")
-                        if not norm_str(n_g): missing.append("Graduação")
-                        if not norm_str(n_l): missing.append("Lotação")
-                        if not norm_str(n_o): missing.append("Origem")
-                        if not norm_str(n_p): missing.append("Senha")
-
-                        if missing:
-                            st.error("Preencha corretamente todos os campos: " + ", ".join(missing) + ".")
-                        else:
-                            novo_email = norm_str(n_e).lower()
-                            novo_tel_digits = tel_only_digits(fmt_tel_cad)
-
-                            email_existe = any(str(u.get("Email", "")).strip().lower() == novo_email for u in records_u_public)
-                            tel_existe = any(tel_only_digits(u.get("TELEFONE", "")) == novo_tel_digits for u in records_u_public)
-
-                            if email_existe and tel_existe:
-                                st.error("E-mail e Telefone já cadastrados.")
-                            elif email_existe:
-                                st.error("E-mail já cadastrado.")
-                            elif tel_existe:
-                                st.error("Telefone já cadastrado.")
-                            else:
-                                usuarios_insert({
-                                    "nome": norm_str(n_n),
-                                    "graduacao": norm_str(n_g),
-                                    "lotacao": norm_str(n_l),
-                                    "senha": norm_str(n_p),
-                                    "origem": norm_str(n_o),
-                                    "email": novo_email,
-                                    "telefone": novo_tel_digits,
-                                    "status": "PENDENTE",
-                                    "temp_senha": "",
-                                    "temp_expira": None,
-                                    "temp_usada": True,
-                                    "last_recuperacao_dados_at": None
-                                })
-                                buscar_usuarios_cadastrados.clear()
-                                buscar_usuarios_admin.clear()
-                                st.success("Cadastro realizado! Aguardando aprovação do Administrador.")
-                                st.rerun()
-
-        # -------------------------
-        # INSTRUÇÕES
-        # -------------------------
-        with t3:
-            st.markdown("### 📖 Guia de Uso")
-            st.success("📲 **COMO INSTALAR (TELA INICIAL)**")
-            st.markdown("**No Chrome (Android):** Toque nos 3 pontos (⋮) e em 'Instalar Aplicativo'.")
-            st.markdown("**No Safari (iPhone):** Toque em Compartilhar (⬆️) e em 'Adicionar à Tela de Início'.")
-            st.markdown("**No Telegram:** Procure o bot `@RotaNovaIguacuBot` e toque no botão 'Abrir App Rota' no menu.")
-            st.divider()
-            st.info("**CADASTRO E LOGIN:** Use seu e-mail como identificador único.")
-            st.markdown("""
-            **1. Regras de Horário:**
-            * **Manhã:** Inscrições abertas até às 05:00h. Reabre às 07:00h.
-            * **Tarde:** Inscrições abertas até às 17:00h. Reabre às 19:00h.
-            * **Finais de Semana:** Abrem domingo às 19:00h.
-
-            **2. Observação:**
-            * Nos períodos em que a lista ficar suspensa para conferência (05:00h às 07:00h / 17:00h às 19:00h), os três PPMM que estiverem no topo da lista terão acesso à lista de check up (botão no topo da lista) para tirar a falta de quem estará entrando no ônibus. O mais antigo assume e na ausência dele o seu sucessor assume.
-            * Após o horário de 06:50h e de 18:50h, a lista será automaticamente zerada para que o novo ciclo da lista possa ocorrer. Sendo assim, caso queira manter um histórico de viagem, antes desses horários, faça o download do pdf e/ou do resumo do W.Zap.
-            """)
-
-        # -------------------------
-        # RECUPERAR (gera senha temp 1 acesso)
-        # -------------------------
-        with t4:
-            st.markdown("### 🔐 Recuperar acesso")
-            st.caption("Confirme **E-mail + Senha**.")
-
-            e_r = st.text_input("E-mail cadastrado:")
-            s_r = st.text_input("Senha do usuário:", type="password")
-
-            c1, c2 = st.columns(2)
-            with c1:
-                btn_email = st.button("📧 Enviar dados para o Email cadastrado 📧", use_container_width=True)
-            with c2:
-                btn_edit = st.button("✏️ EDITAR CADASTRO ✏️", use_container_width=True)
-
-            def _validar_email_senha():
-                if not str(e_r or "").strip():
-                    st.error("Informe o e-mail cadastrado.")
-                    return None, None, None
-                if not str(s_r or "").strip():
-                    st.error("Informe a senha do usuário.")
-                    return None, None, None
-                uid, u_raw = buscar_user_by_email_senha(e_r, s_r)
-                if not uid or not u_raw:
-                    st.error("Dados não encontrados (verifique e-mail e senha).")
-                    return None, None, None
-                u_ui = map_user_row(u_raw)
-                return uid, u_raw, u_ui
-
-            # 1) MANTER botão e funcionalidade de envio por e-mail (agora validando por e-mail + senha)
-            if btn_email:
-                uid, u_raw, u_ui = _validar_email_senha()
-                if uid and u_ui:
-                    ok, prev_value, new_value, next_allowed = try_acquire_recuperacao_token(uid)
-                    if not ok:
-                        when_txt = next_allowed.strftime("%d/%m/%Y %H:%M") if next_allowed else "amanhã"
-                        st.warning(f"⚠️ Você já recuperou seus dados hoje. Tente novamente {when_txt}.")
-                    else:
-                        try:
-                            enviar_dados_cadastrais_para_email(u_ui)
-                            st.success("✅ Dados enviados para o e-mail cadastrado.")
-                        except Exception as ex:
-                            # Se falhar o e-mail, desfaz o bloqueio do dia (rollback)
-                            rollback_recuperacao_token(uid, prev_value)
-                            st.error(f"Falha ao enviar e-mail: {ex}")
-
-            # 2) EDITAR CADASTRO (substitui o 'Gerar senha temporária')
-            if btn_edit:
-                uid, u_raw, u_ui = _validar_email_senha()
-                if uid and u_ui:
-                    st.session_state._edit_cadastro = True
-                    st.session_state._edit_user_id = uid
-                    st.session_state._edit_user_ui = u_ui
-
-            if st.session_state.get("_edit_cadastro", False):
-                u_ui = st.session_state.get("_edit_user_ui") or {}
-                st.divider()
-                st.subheader("✏️ Editar cadastro (o e-mail não pode ser alterado)")
-
-                # Opções fixas (ordem solicitada)
-                grad_opcoes = ["TCEL", "MAJ", "CAP", "1º TEN", "2º TEN", "SUBTEN", "1º SGT", "2º SGT", "3º SGT", "CB", "SD", "FC COM", "FC TER"]
-                origem_opcoes = ["QG", "RMCF", "OUTROS"]
-
-                with st.form("form_editar_cadastro"):
-                    nome_novo = st.text_input("Nome de Escala:", value=str(u_ui.get("Nome", "") or ""))
-                    tel_novo_raw = st.text_input("Telefone:", value=tel_format_br(u_ui.get("TELEFONE", "") or ""))
-                    tel_novo_fmt = tel_format_br(tel_novo_raw)
-
-                    grad_atual = str(u_ui.get("Graduação", "") or "")
-                    if grad_atual not in grad_opcoes:
-                        grad_atual = grad_opcoes[0]
-                    grad_nova = st.selectbox("Graduação:", grad_opcoes, index=grad_opcoes.index(grad_atual))
-
-                    lot_nova = st.text_input("Lotação:", value=str(u_ui.get("Lotação", "") or ""))
-
-                    orig_atual = str(u_ui.get("QG_RMCF_OUTROS", "") or "")
-                    if orig_atual not in origem_opcoes:
-                        orig_atual = origem_opcoes[0]
-                    orig_nova = st.selectbox("Origem:", origem_opcoes, index=origem_opcoes.index(orig_atual))
-
-                    st.caption("Se não quiser trocar a senha, deixe em branco.")
-                    senha1 = st.text_input("Nova senha:", type="password")
-                    senha2 = st.text_input("Confirmar nova senha:", type="password")
-
-                    salvar = st.form_submit_button("💾 SALVAR ALTERAÇÕES", use_container_width=True)
-
-                if salvar:
-                    if not str(nome_novo or "").strip():
-                        st.error("Informe o Nome de Escala.")
-                    elif not tel_is_valid_11(tel_novo_fmt):
-                        st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
-                    elif not str(lot_nova or "").strip():
-                        st.error("Informe a Lotação.")
-                    elif (senha1 or senha2) and (senha1 != senha2):
-                        st.error("As senhas não conferem.")
-                    else:
-                        try:
-                            uid = st.session_state.get("_edit_user_id")
-                            if not uid:
-                                st.error("Não foi possível identificar o usuário para edição.")
-                            else:
-                                payload = {
-                                    "nome": str(nome_novo).strip(),
-                                    "telefone": tel_only_digits(tel_novo_fmt),
-                                    "graduacao": str(grad_nova).strip(),
-                                    "lotacao": str(lot_nova).strip(),
-                                    "origem": str(orig_nova).strip(),
-                                    # limpa temporária (garante que não fique pendência)
-                                    "temp_senha": None,
-                                    "temp_expira": None,
-                                    "temp_usada": True,
-                                }
-                                if str(senha1 or "").strip():
-                                    payload["senha"] = str(senha1)
-
-                                usuarios_update({"id": uid}, payload)
-
-                                st.success("✅ Cadastro atualizado.")
-                                st.session_state._edit_cadastro = False
-                                st.session_state._edit_user_id = None
-                                st.session_state._edit_user_ui = None
-                                st.rerun()
-                        except Exception as ex:
-                            st.error(f"Falha ao atualizar cadastro: {ex}")
-
-
-        with t5:
-            with st.form("form_admin"):
-                ad_u = st.text_input("Usuário ADM:")
-                ad_s = st.text_input("Senha ADM:", type="password")
-                entrou_adm = st.form_submit_button("☠️ ACESSAR PAINEL ☠️")
-                if entrou_adm:
-                    if ad_u == "Administrador" and ad_s == "Administrador@123":
-                        st.session_state.is_admin = True
-                        st.session_state._adm_first_load = True
-                        st.rerun()
-                    else:
-                        st.error("ADM inválido.")
-
-    # =========================================
-    # PAINEL ADM
-    # =========================================
-    elif st.session_state.is_admin:
-        st.header("🛡️ PAINEL ADMINISTRATIVO 🛡️")
-
-        sair_btn = st.button("⬅️ SAIR DO PAINEL")
-        if sair_btn:
-            st.session_state.is_admin = False
-            st.session_state._adm_first_load = False
-            st.rerun()
-
-        if st.session_state._adm_first_load:
-            buscar_usuarios_admin.clear()
-            st.session_state._adm_first_load = False
-
-        records_u_raw = buscar_usuarios_admin()
-        records_u = [user_to_ui_dict(u) for u in records_u_raw]
-
-        cA, cB = st.columns([1, 1])
-        with cA:
-            att_btn = st.button("🔄 Atualizar Usuários", use_container_width=True)
-            if att_btn:
-                buscar_usuarios_admin.clear()
-                st.rerun()
-        with cB:
-            st.caption("ADM lê mais fresco (TTL=3s).")
-
-        st.subheader("⚙️ Configurações Globais")
-        novo_limite = st.number_input("Limite máximo de usuários:", value=int(limite_max))
-        salvar_lim = st.button("💾 SALVAR NOVO LIMITE")
-        if salvar_lim:
-            config_set_int("limite_usuarios", int(novo_limite))
-            st.success("Limite atualizado!")
-            st.rerun()
-
-        st.divider()
-        st.subheader("👥 Gestão de Usuários")
-        busca = st.text_input("🔍 Pesquisar por Nome ou E-mail:").strip().lower()
-
-        ativar_all = st.button("✅ ATIVAR TODOS E DESLOGAR", use_container_width=True)
-        if ativar_all and records_u_raw:
-            for u in records_u_raw:
-                usuarios_update({"id": u["id"]}, {"status": "ATIVO"})
-            buscar_usuarios_admin.clear()
-            buscar_usuarios_cadastrados.clear()
-            st.session_state.clear()
-            st.rerun()
-
-        for i, user in enumerate(records_u):
-            nome = user.get("Nome", "")
-            email = user.get("Email", "")
-            if busca == "" or busca in str(nome).lower() or busca in str(email).lower():
-                status = str(user.get("STATUS", "")).upper()
-                with st.expander(f"{user.get('Graduação')} {nome} - {status}"):
-                    c1, c2, c3 = st.columns([2, 1, 1])
-                    c1.write(f"📧 {email} | 📱 {user.get('TELEFONE')}")
-                    is_ativo = (status == "ATIVO")
-
-                    new_val = c2.checkbox("Liberar", value=is_ativo, key=f"adm_chk_{i}")
-                    if new_val != is_ativo:
-                        usuarios_update({"id": user["id"]}, {"status": "ATIVO" if new_val else "INATIVO"})
-                        buscar_usuarios_admin.clear()
-                        buscar_usuarios_cadastrados.clear()
-                        st.rerun()
-
-                    del_btn = c3.button("🗑️", key=f"del_{i}")
-                    if del_btn:
-                        usuarios_delete({"id": user["id"]})
-                        buscar_usuarios_admin.clear()
-                        buscar_usuarios_cadastrados.clear()
-                        st.rerun()
-
-    # =========================================
-    # USUÁRIO LOGADO
-    # =========================================
-    else:
-        u = st.session_state.usuario_logado
-
-        # ------------------------------------------------------
-        # Se entrou com senha temporária: forçar trocar senha + editar cadastro (exceto e-mail)
-        # ------------------------------------------------------
-        if st.session_state.get("_force_password_change", False) or st.session_state.get("_force_profile_edit", False):
-            st.warning("🔐 Você entrou com uma **senha temporária**. Confirme seus dados e defina uma **nova senha** para concluir o acesso.")
-
-            st.markdown("### ✅ Atualizar Cadastro (e-mail não pode mudar)")
-            with st.form("form_update_profile_temp"):
-                st.text_input("E-mail (fixo):", value=str(u.get("Email","")), disabled=True)
-                nome_n = st.text_input("Nome de Escala:", value=str(u.get("Nome","")))
-                grad_n = st.selectbox("Graduação:", LISTA_GRAD, index=max(0, LISTA_GRAD.index(str(u.get("Graduação","")))) if str(u.get("Graduação","")) in LISTA_GRAD else 0)
-                lot_n = st.text_input("Lotação:", value=str(u.get("Lotação","")))
-                orig_n = st.selectbox("Origem:", LISTA_ORIGEM, index=max(0, LISTA_ORIGEM.index(str(u.get("QG_RMCF_OUTROS","")))) if str(u.get("QG_RMCF_OUTROS","")) in LISTA_ORIGEM else 0)
-
-                raw_tel = st.text_input("Telefone (DDD + 9 dígitos):", value=tel_format_br(u.get("TELEFONE","")))
-                fmt_tel = tel_format_br(raw_tel)
-
-                nova1 = st.text_input("Nova senha:", type="password")
-                nova2 = st.text_input("Confirmar nova senha:", type="password")
-
-                ok_btn = st.form_submit_button("💾 SALVAR E ENTRAR", use_container_width=True)
-
-            if ok_btn:
-                if not norm_str(nome_n):
-                    st.error("Informe o Nome de Escala.")
-                elif not norm_str(lot_n):
-                    st.error("Informe a Lotação.")
-                elif not tel_is_valid_11(fmt_tel):
-                    st.error("Telefone inválido. Use DDD + 9 dígitos (ex: (21) 98765.4321).")
-                elif not norm_str(nova1):
-                    st.error("Informe a nova senha.")
-                elif nova1 != nova2:
-                    st.error("As senhas não conferem.")
-                else:
-                    try:
-                        tel_digits = tel_only_digits(fmt_tel)
-                        # evita colisão de telefone com outro usuário
-                        outros = usuarios_select({"telefone": tel_digits})
-                        outros = [o for o in outros if str(o.get("email","")).lower() != str(u.get("Email","")).lower()]
-                        if outros:
-                            st.error("Telefone já cadastrado por outro usuário.")
-                        else:
-                            u_raw = usuarios_select({"email": str(u.get("Email","")).lower()})
-                            if not u_raw:
-                                st.error("Não encontrei seu usuário no banco para atualizar.")
-                            else:
-                                uid = u_raw[0]["id"]
-                                usuarios_update({"id": uid}, {
-                                    "nome": norm_str(nome_n),
-                                    "graduacao": norm_str(grad_n),
-                                    "lotacao": norm_str(lot_n),
-                                    "origem": norm_str(orig_n),
-                                    "telefone": tel_digits,
-                                    "senha": str(nova1),
-                                    "temp_senha": "",
-                                    "temp_expira": None,
-                                    "temp_usada": True
-                                })
-                                buscar_usuarios_cadastrados.clear()
-                                buscar_usuarios_admin.clear()
-
-                                # atualiza sessão
-                                u["Nome"] = norm_str(nome_n)
-                                u["Graduação"] = norm_str(grad_n)
-                                u["Lotação"] = norm_str(lot_n)
-                                u["QG_RMCF_OUTROS"] = norm_str(orig_n)
-                                u["TELEFONE"] = tel_digits
-                                u["Senha"] = str(nova1)
-
-                                st.session_state._force_password_change = False
-                                st.session_state._force_profile_edit = False
-                                st.session_state._login_kind = "REAL"
-                                st.success("✅ Cadastro e senha atualizados. Acesso liberado.")
-                                st.rerun()
-                    except Exception as ex:
-                        st.error(f"Falha ao atualizar: {ex}")
-
-            st.stop()
-
-        # Sidebar
-        st.sidebar.markdown("### 👤 Usuário Conectado 🙍‍♂️")
-        st.sidebar.info(f"**{u.get('Graduação')} {u.get('Nome')}**")
-        sair_user = st.sidebar.button("⬅️ Sair", use_container_width=True)
-        if sair_user:
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
-
-        st.sidebar.markdown("---")
-        st.sidebar.caption("Desenvolvido por: MAJ ANDRÉ AGUIAR - CAES®️")
-
-        # Presença
-        if st.session_state._force_refresh_presenca:
-            buscar_presenca_atualizada.clear()
-            st.session_state._force_refresh_presenca = False
-
-        presencas_raw = buscar_presenca_atualizada()
-
-        # === Ciclo atual (data/hora) ===
-        ciclo_hora, ciclo_data_br = obter_ciclo_atual()
-        try:
-            ciclo_data_iso = ciclo_data_br.strftime("%Y-%m-%d")
-        except Exception:
-            ciclo_data_iso = str(ciclo_data_br)
-
-        ciclo_key = f"{ciclo_data_iso}_{ciclo_hora}"
-
-        # Limpa automaticamente presenças de ciclos anteriores (1x por ciclo por sessão)
-        if st.session_state.get("_ciclo_limpeza_key") != ciclo_key:
-            try:
-                limpar_presencas_de_outros_ciclos(ciclo_hora, ciclo_data_iso)
-            finally:
-                st.session_state["_ciclo_limpeza_key"] = ciclo_key
-            presencas_raw = buscar_presenca_atualizada()
-
-        # Define se está aberto para novas confirmações + limpeza por marco (06:50/18:50)
-        aberto, janela_conferencia = verificar_status_e_limpar_db(presencas_raw)
-
-        if not aberto:
-            st.info("⏳ Lista fechada para novas inscrições.")
-
-        # Dados do usuário logado
-        u_log = user_to_ui_dict(st.session_state.get("usuario_logado") or {})
-        usuario_id_logado = u_log.get("id")
-        nome_logado = u_log.get("nome_escala") or ""
-        graduacao_logado = u_log.get("graduacao") or ""
-        lotacao_logado = u_log.get("lotacao") or ""
-        origem_logado = u_log.get("origem") or "QG"
-        email_logado = u_log.get("email") or ""
-        telefone_logado = u_log.get("telefone") or ""
-
-        def _ja_confirmou_no_ciclo() -> bool:
-            if not usuario_id_logado:
-                return False
-            for rr in presencas_raw or []:
-                try:
-                    if rr.get("usuario_id") != usuario_id_logado:
-                        continue
-                    if str(rr.get("ciclo_hora")) != str(ciclo_hora):
-                        continue
-                    if str(rr.get("ciclo_data")) != str(ciclo_data_iso):
-                        continue
-                    return True
-                except Exception:
-                    pass
-            return False
-
-        ja_confirmou = _ja_confirmou_no_ciclo()
-
-        # Ação principal: confirmar / excluir
-        if ja_confirmou:
-            st.warning("⚠️ Você já confirmou sua presença neste ciclo.")
-            if st.button("🚫 EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_minha_presenca"):
-                try:
-                    if not usuario_id_logado:
-                        raise Exception("Usuário não identificado (sessão). Faça login novamente.")
-                    supabase.table("presencas").delete() \
-                        .eq("usuario_id", usuario_id_logado) \
-                        .eq("ciclo_hora", str(ciclo_hora)) \
-                        .eq("ciclo_data", str(ciclo_data_iso)) \
-                        .execute()
-                    st.success("✅ Presença excluída.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Falha ao excluir presença: {e}")
+    Normaliza o registro do usuário vindo do Supabase para um dicionário usado na UI.
+    Suporta esquemas antigos/novos (nome vs nome_escala, is_admin vs admin, aprovado vs status/ativo).
+    """
+    if not isinstance(u, dict):
+        u = {}
+
+    # Campos básicos (com fallback)
+    user_id = u.get("id") or u.get("usuario_id") or u.get("user_id")
+    email = u.get("email") or u.get("e_mail") or u.get("Email") or u.get("EMAIL")
+    telefone = u.get("telefone") or u.get("phone") or u.get("celular") or u.get("Telefone")
+    nome = u.get("nome_escala") or u.get("nome") or u.get("Nome") or u.get("NOME")
+    graduacao = u.get("graduacao") or u.get("patente") or u.get("Graduacao")
+    lotacao = u.get("lotacao") or u.get("unidade") or u.get("Lotacao")
+    origem = u.get("origem") or u.get("setor") or u.get("Origem")
+
+    # Admin / aprovação (com fallback)
+    is_admin = bool(u.get("is_admin") if u.get("is_admin") is not None else u.get("admin") or u.get("isAdmin") or u.get("ADMIN"))
+    aprovado_raw = u.get("aprovado")
+    if aprovado_raw is None:
+        # Alguns esquemas podem usar 'status'/'STATUS'/'ativo'
+        status = (u.get("status") or u.get("STATUS") or "").strip().upper()
+        ativo = u.get("ativo")
+        if isinstance(ativo, bool):
+            aprovado = ativo
+        elif status in ("ATIVO", "APROVADO", "LIBERADO", "OK", "SIM", "TRUE"):
+            aprovado = True
+        elif status in ("PENDENTE", "BLOQUEADO", "INATIVO", "NAO", "NÃO", "FALSE"):
+            aprovado = False
         else:
-            if aberto:
-                if st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_minha_presenca"):
-                    try:
-                        if not usuario_id_logado:
-                            raise Exception("Usuário não identificado (sessão). Faça login novamente.")
-                        payload = {
-                            "usuario_id": usuario_id_logado,
-                            "nome": nome_logado,
-                            "graduacao": graduacao_logado,
-                            "lotacao": lotacao_logado,
-                            "qg_rmcf_outros": origem_logado,
-                            "email": email_logado,
-                            "telefone": telefone_logado,
-                            "ciclo_hora": str(ciclo_hora),
-                            "ciclo_data": str(ciclo_data_iso),
-                        }
-                        supabase.table("presencas").insert(payload).execute()
-                        st.success("✅ Presença confirmada!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Falha ao confirmar presença: {e}")
-            else:
-                if janela_conferencia:
-                    st.warning(f"⏳ Lista fechada. {janela_conferencia}")
-                else:
-                    st.warning("⏳ Lista fechada no momento.")
-            with c_up1:
-                up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_tabela")
-                if up_btn:
-                    st.rerun()
-                    st.rerun()
-            with c_up2:
-                st.caption("Atualiza sob demanda.")
+            # Se não existir campo, assume aprovado (evita travar login por schema)
+            aprovado = True
+    else:
+        aprovado = bool(aprovado_raw)
 
-            st.write(
-                f"<div class='tabela-responsiva'>{df_v.drop(columns=['EMAIL']).to_html(index=False, justify='center', border=0, escape=False)}</div>",
-                unsafe_allow_html=True
-            )
+    STATUS = "ATIVO" if aprovado else "PENDENTE"
 
-            c1, c2 = st.columns(2)
-            with c1:
-                insc = int(df_o.shape[0]) if df_o is not None else 0
-                resumo = {"inscritos": insc, "vagas": 38}
-                pdf_bytes = gerar_pdf_apresentado(df_o, resumo)
-                _ = st.download_button(
-                    "📄 PDF (Relatório)",
-                    pdf_bytes,
-                    "lista_rota_nova_iguacu.pdf",
-                    use_container_width=True
-                )
+    # Timestamp do limite de recuperação
+    last_rec = u.get("last_recuperacao_dados_at") or u.get("ultima_recuperacao_dados_at")
 
-            with c2:
-                txt_w = "*🚌 LISTA DE PRESENÇA*\n\n"
-                for _, r in df_o.iterrows():
-                    txt_w += f"{r['Nº']}. {r['GRADUAÇÃO']} {r['NOME']}\n"
-                st.markdown(
-                    f'<a href="https://wa.me/?text={urllib.parse.quote(txt_w)}" target="_blank">'
-                    f"<button style='width:100%; height:38px; background-color:#25D366; color:white; border:none; "
-                    f"border-radius:4px; font-weight:bold;'>🟢 WHATSAPP</button></a>",
-                    unsafe_allow_html=True
-                )
-
-    st.markdown('<div class="footer">Desenvolvido por: <b>MAJ ANDRÉ AGUIAR - CAES®️</b></div>', unsafe_allow_html=True)
-
-    st.markdown(
-        f"""
-        <div style="width:100%; text-align:center; margin-top:12px;">
-            <img src="{GIF_URL}" style="width:80%; max-width:520px; height:auto;" />
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-except Exception as e:
-    st.error(f"⚠️ Erro: {e}")
+    return {
+        "id": user_id,
+        "email": email,
+        "telefone": telefone,
+        "nome_escala": nome,
+        "graduacao": graduacao,
+        "lotacao": lotacao,
+        "origem": origem,
+        "is_admin": is_admin,
+        "aprovado": aprovado,
+        "STATUS": STATUS,
+        "last_recuperacao_dados_at": last_rec,
+    }
