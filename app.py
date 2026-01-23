@@ -1274,63 +1274,48 @@ try:
             email_logado = str(u.get("Email")).strip().lower()
             ja = any(email_logado == str(row.get("EMAIL", "")).strip().lower() for _, row in df_o.iterrows())
             if ja:
-                pos = df_o.index[df_o["EMAIL"].str.lower() == email_logado].tolist()[0] + 1
+                st.warning("⚠️ Você já confirmou sua presença neste ciclo.")
+                exc_btn = st.button("🚫 EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_minha_presenca")
+                if exc_btn:
+                    try:
+                        presenca_delete(email=email_logado, data=ciclo_data, hora=ciclo_hora)
+                        st.success("✅ Presença excluída.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha ao excluir presença: {e}")
 
-        if ja:
-            st.success(f"✅ Presença registrada: {pos}º")
-exc_btn = st.button("❌ EXCLUIR MINHA PRESENÇA ⚠️", use_container_width=True, key="btn_excluir_minha_presenca")
-            if exc_btn:
-                email_logado = str(u.get("Email")).strip().lower()
-                presenca_delete({"email": email_logado})
-                buscar_presenca_atualizada.clear()
-                st.rerun()
+            elif aberto:
+                salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_presenca")
+                if salvar_btn:
+                    try:
+                        presenca_insert({
+                            "usuario_id": usuario_id_logado,
+                            "nome": nome_logado,
+                            "graduacao": graduacao_logado,
+                            "lotacao": lotacao_logado,
+                            "origem": origem_logado,
+                            "data": ciclo_data,
+                            "hora": ciclo_hora,
+                            "data_hora": datetime.now(pytz.UTC).isoformat(),
+                            "email": email_logado,
+                            "telefone": telefone_logado,
+                        })
+                        st.success("✅ Presença confirmada com sucesso.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha ao confirmar presença: {e}")
 
-        elif aberto:
-salvar_btn = st.button("🚀 CONFIRMAR MINHA PRESENÇA ✅", use_container_width=True, key="btn_confirmar_minha_presenca")
-            if salvar_btn:
-                agora = _br_now()
-                resp_p = presenca_insert({
-                    "usuario_id": u.get("id"),
-                    "nome": u.get("Nome") or u.get("nome") or "",
-                    "graduacao": u.get("Graduação") or u.get("graduacao") or "",
-                    "lotacao": u.get("Lotação") or u.get("lotacao") or "",
-                    "origem": u.get("Origem") or u.get("origem") or "",
-                    "data_hora": _br_now().isoformat(),
-                    "email": (u.get("Email") or u.get("email") or ""),
-                    "telefone": (u.get("Telefone") or u.get("telefone") or None),
-                })
-                buscar_presenca_atualizada.clear()
-                st.rerun()
-        else:
-            st.info("⌛ Lista fechada para novas inscrições.")
-up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_fechado")
-            if up_btn_fechado:
-                buscar_presenca_atualizada.clear()
-                st.rerun()
-
-        # Conferência
-        if ja and pos <= 3 and janela_conf:
-            st.divider()
-            st.subheader("📋 LISTA DE EMBARQUE 📋")
-painel_btn = st.button("✍️ CONFERÊNCIA ✍️", use_container_width=True, key="btn_conferencia")
-            if painel_btn:
-                st.session_state.conf_ativa = not st.session_state.conf_ativa
-
-            if st.session_state.conf_ativa and len(dados_p_show) > 1:
-                for i, row in df_o.iterrows():
-                    label = f"{row.get('Nº','')} - {row.get('NOME','')}".strip()
-                    _ = st.checkbox(label if label else " ", key=f"chk_p_{i}")
-
-        if len(dados_p_show) > 1:
-            insc = len(df_o)
-            rest = 38 - insc
-            st.subheader(f"Inscritos: {insc} | Vagas: 38 | {'Sobra' if rest >= 0 else 'Exc'}: {abs(rest)}")
+            else:
+                st.info("⏳ Lista fechada para novas inscrições.")
+                up_btn_fechado = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_lista_fechada")
+                if up_btn_fechado:
+                    st.rerun()
 
             c_up1, c_up2 = st.columns([1, 1])
             with c_up1:
-up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_lista")
+                up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualizar_tabela")
                 if up_btn:
-                    buscar_presenca_atualizada.clear()
+                    st.rerun()
                     st.rerun()
             with c_up2:
                 st.caption("Atualiza sob demanda.")
@@ -1342,6 +1327,7 @@ up_btn = st.button("🔄 ATUALIZAR", use_container_width=True, key="btn_atualiza
 
             c1, c2 = st.columns(2)
             with c1:
+                insc = int(df_o.shape[0]) if df_o is not None else 0
                 resumo = {"inscritos": insc, "vagas": 38}
                 pdf_bytes = gerar_pdf_apresentado(df_o, resumo)
                 _ = st.download_button(
