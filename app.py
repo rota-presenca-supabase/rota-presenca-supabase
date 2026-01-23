@@ -453,13 +453,11 @@ def buscar_limite_dinamico():
 @st.cache_data(ttl=6)
 def buscar_presenca_atualizada():
     try:
-        return presenca_select()
+        rows = presenca_select()
+        return [map_presenca_row(r) for r in (rows or [])]
     except Exception:
         return []
 
-# ==========================================================
-# PRESENÇA: limpeza por ciclo (equivalente ao resize do Sheets)
-# ==========================================================
 def verificar_status_e_limpar_db(presencas_rows):
     """Retorna (is_aberto, janela_conferencia).
 
@@ -747,29 +745,50 @@ def email_basic_ok(e: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(e or "").strip()))
 
 def user_to_ui_dict(u: dict) -> dict:
-    """Normaliza o row do usuário para chaves que o app usa, cobrindo variações de coluna."""
+    """Normaliza o row do usuário para chaves que o app usa (e evita None no UI)."""
     if not u:
         return {}
 
-    # variações possíveis vindas do banco / versões antigas
-    nome = u.get("nome") or u.get("nome_escala") or u.get("nomeEscala") or ""
-    origem = u.get("origem") or u.get("qg_rmcf_outros") or u.get("QG_RMCF_OUTROS") or ""
-    telefone = u.get("telefone") or u.get("tel") or u.get("Telefone") or ""
+    email = (_get_any(u, ["email", "Email", "E-mail", "E-mail cadastrado", "e_mail"], "") or "").strip().lower()
+    nome = _get_any(u, ["nome", "nome_escala", "nomeEscala", "Nome de Escala", "Nome", "nome_de_escala"], "")
+    telefone = _get_any(u, ["telefone", "tel", "Telefone", "phone"], "")
+    graduacao = _get_any(u, ["graduacao", "Graduacao", "Graduação", "GRADUAÇÃO"], "")
+    lotacao = _get_any(u, ["lotacao", "Lotacao", "Lotação", "LOTAÇÃO"], "")
+    origem = _get_any(u, ["origem", "qg_rmcf_outros", "QG_RMCF_OUTROS", "QG"], "")
+    status = (_get_any(u, ["status", "STATUS"], "") or "").strip().upper()
+
+    # no app atual a senha é texto no BD (coluna 'senha')
+    senha = _get_any(u, ["senha", "Senha", "SENHA"], "")
 
     ui = {
-        "id": u.get("id"),
-        "nome_escala": nome,
-        "graduacao": u.get("graduacao") or u.get("Graduacao") or "",
-        "lotacao": u.get("lotacao") or u.get("Lotacao") or "",
+        # canônicas
+        "id": _get_any(u, ["id", "ID"], None),
+        "nome_escala": nome or email,
+        "graduacao": graduacao,
+        "lotacao": lotacao,
         "origem": origem,
-        # atenção: no seu app a senha está em texto no BD (coluna 'senha')
-        "senha": u.get("senha") or "",
-        "email": (u.get("email") or u.get("Email") or "").strip().lower(),
+        "senha": senha,
+        "email": email,
+        "status": status,
         "telefone": telefone,
-        "last_recuperacao_dados_at": u.get("last_recuperacao_dados_at"),
+        "last_recuperacao_dados_at": _get_any(u, ["last_recuperacao_dados_at", "Last_recuperacao_dados_at", "LAST_RECUPERACAO_DADOS_AT"], None),
     }
-    return ui
 
+    # compatibilidade: chaves antigas usadas em algumas telas
+    ui.update({
+        "Nome": ui["nome_escala"],
+        "Nome de Escala": ui["nome_escala"],
+        "Email": ui["email"],
+        "E-mail": ui["email"],
+        "Telefone": ui["telefone"],
+        "Graduação": ui["graduacao"],
+        "Lotação": ui["lotacao"],
+        "Origem": ui["origem"],
+        "STATUS": ui["status"],
+        "Senha": ui["senha"],
+    })
+
+    return ui
 def _pick(row, *keys, default=None):
     """Retorna o primeiro valor não-vazio encontrado em 'row' para qualquer uma das chaves informadas.
     Também tenta variações em maiúsculo/minúsculo automaticamente.
@@ -787,57 +806,76 @@ def _pick(row, *keys, default=None):
             return row.get(kl)
     return default
 
-def map_user_row(row):
-    """Normaliza uma linha da tabela 'usuarios' para um dicionário padrão usado no app."""
-    # Aceita várias nomenclaturas (por segurança, pois seu DB pode ter colunas com nomes diferentes)
-    user_id = _pick(row, "id", "usuario_id", "user_id")
-    nome = _pick(row, "nome", "nome_escala", "nome_de_escala", "nome_esc", "nome_completo", default="")
-    email = _pick(row, "email", "e-mail", "mail", default="")
-    telefone = _pick(row, "telefone", "tel", "celular", default="")
-    graduacao = _pick(row, "graduacao", "grad", default="")
-    lotacao = _pick(row, "lotacao", "lot", default="")
-    origem = _pick(row, "origem", "qg_rmcf_outros", "qg", default="")
-    senha = _pick(row, "senha", "password", "senha_plana", default="")
-    senha_hash = _pick(row, "senha_hash", "password_hash", "hash_senha")
-    status_raw = _pick(row, "status", "STATUS", "ativo", "aprovado", default=None)
+def map_user_row(row: dict) -> dict:
+    """Normaliza um registro vindo do Supabase para o formato UI (chaves com acento)."""
+    if not isinstance(row, dict):
+        return {}
 
-    # Normaliza status
-    status_norm = "ATIVO"
-    if status_raw in (None, ""):
-        status_norm = "ATIVO"
-    elif isinstance(status_raw, bool):
-        status_norm = "ATIVO" if status_raw else "PENDENTE"
-    else:
-        s = str(status_raw).strip().upper()
-        status_norm = s if s else "ATIVO"
+    def pick(*keys, default=None):
+        for k in keys:
+            if k in row and row.get(k) is not None:
+                return row.get(k)
+        return default
 
-    last_rec = _pick(row, "last_recuperacao_dados_at", "last_recuperacao_at", "last_recuperacao", "ultima_recuperacao")
-
-    return {
-        "id": user_id,
-        "nome": str(nome) if nome is not None else "",
-        "email": str(email) if email is not None else "",
-        "telefone": str(telefone) if telefone is not None else "",
-        "graduacao": str(graduacao) if graduacao is not None else "",
-        "lotacao": str(lotacao) if lotacao is not None else "",
-        "origem": str(origem) if origem is not None else "",
-        "senha": str(senha) if senha is not None else "",
-        "senha_hash": senha_hash,
-        "last_recuperacao_dados_at": last_rec,
-        "status": status_norm,
-        "STATUS": status_norm,
-
-        # chaves usadas na UI antiga (mantém compatibilidade)
-        "NOME": str(nome) if nome is not None else "",
-        "EMAIL": str(email) if email is not None else "",
-        "TELEFONE": str(telefone) if telefone is not None else "",
-        "GRADUAÇÃO": str(graduacao) if graduacao is not None else "",
-        "LOTAÇÃO": str(lotacao) if lotacao is not None else "",
-        "ORIGEM": str(origem) if origem is not None else "",
-        "SENHA": str(senha) if senha is not None else "",
+    raw = {
+        "id": pick("id", "ID"),
+        "email": pick("email", "Email", "e_mail"),
+        "telefone": pick("telefone", "Telefone", "tel", "celular"),
+        "senha": pick("senha", "Senha", "password"),
+        "nome_escala": pick("nome_escala", "nome", "Nome de Escala"),
+        "graduacao": pick("graduacao", "Graduação", "grad"),
+        "lotacao": pick("lotacao", "Lotação", "lot"),
+        "origem": pick("origem", "Origem", "qg_rmcf_outros", "qg"),
+        "status": pick("status", "STATUS", default="PENDENTE"),
+        "created_at": pick("created_at"),
+        "updated_at": pick("updated_at"),
+        "last_recuperacao_dados_at": pick("last_recuperacao_dados_at"),
     }
+    return user_to_ui_dict(raw)
 
+def _get_any(d: dict, keys, default=None):
+    """Retorna o primeiro valor não-nulo / não-vazio dentre as chaves informadas."""
+    for k in keys:
+        if not k:
+            continue
+        v = d.get(k, None) if isinstance(d, dict) else None
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        return v
+    return default
 
+def map_presenca_row(row: dict) -> dict:
+    """Normaliza uma linha de 'presencas' para chaves usadas no app (inclusive legado)."""
+    r = row or {}
+    data_hora = _get_any(r, ["data_hora", "DATA_HORA", "dataHora", "created_at"], "")
+    qg_rmcf_outros = _get_any(r, ["qg_rmcf_outros", "QG_RMCF_OUTROS", "origem"], "")
+    graduacao = _get_any(r, ["graduacao", "GRADUAÇÃO", "graduacao_txt"], "")
+    nome = _get_any(r, ["nome", "NOME", "nome_escala", "Nome de Escala", "Nome"], "")
+    lotacao = _get_any(r, ["lotacao", "LOTAÇÃO", "lotacao_txt"], "")
+
+    # Mantém o id do usuário para operações (confirmar/excluir)
+    usuario_id = _get_any(r, ["usuario_id", "USUARIO_ID", "user_id"], None)
+    presenca_id = _get_any(r, ["id", "ID"], None)
+
+    out = {
+        "id": presenca_id,
+        "usuario_id": usuario_id,
+        "data_hora": data_hora,
+        "qg_rmcf_outros": qg_rmcf_outros,
+        "graduacao": graduacao,
+        "nome": nome,
+        "lotacao": lotacao,
+
+        # chaves legadas usadas em dataframes/telas
+        "DATA_HORA": data_hora,
+        "QG_RMCF_OUTROS": qg_rmcf_outros,
+        "GRADUAÇÃO": graduacao,
+        "NOME": nome,
+        "LOTAÇÃO": lotacao,
+    }
+    return out
 
 def _senha_temp_valida(u_dict):
     temp = str(u_dict.get("TEMP_SENHA", "") or "").strip()
