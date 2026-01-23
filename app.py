@@ -461,69 +461,74 @@ def buscar_presenca_atualizada():
 # PRESENÇA: limpeza por ciclo (equivalente ao resize do Sheets)
 # ==========================================================
 def verificar_status_e_limpar_db(presencas_rows):
-    agora = _br_now()
-    hora_atual, dia_semana = agora.time(), agora.weekday()
+    """Retorna (is_aberto, janela_conferencia).
 
+    Também faz a 'limpeza por marco' para não carregar presenças antigas quando muda o ciclo.
+    - Marco 06:50 e 18:50 (horário de Brasília).
+    - Se existir presença mais recente anterior ao marco atual, zera a tabela.
+    """
+    agora = _br_now()
+    hora_atual = agora.time()
+
+    # Define o marco (início do ciclo "atual") em horário BR
     if hora_atual >= time(18, 50):
         marco = agora.replace(hour=18, minute=50, second=0, microsecond=0)
     elif hora_atual >= time(6, 50):
         marco = agora.replace(hour=6, minute=50, second=0, microsecond=0)
     else:
+        # antes de 06:50 -> ainda é o ciclo iniciado ontem 18:50
         marco = (agora - timedelta(days=1)).replace(hour=18, minute=50, second=0, microsecond=0)
 
-    # se a última presença for anterior ao marco, zera tabela
+    # 1) Limpeza automática (se houver presenças mais antigas que o marco atual)
     if presencas_rows:
         try:
-            # pega a mais recente (comparando por datetime, não por string)
             from dateutil import parser as _dtparser
-            dts = []
+            ultima_dt = None
             for r in presencas_rows or []:
-                dh = r.get("data_hora") if isinstance(r, dict) else None
+                dh = r.get("data_hora")
                 if not dh:
                     continue
                 try:
-                    dts.append(_dtparser.isoparse(dh))
+                    dt_obj = _dtparser.isoparse(dh) if isinstance(dh, str) else dh
                 except Exception:
+                    continue
+                if dt_obj is None:
+                    continue
+                if dt_obj.tzinfo is None:
+                    dt_obj = dt_obj.replace(tzinfo=pytz.utc)
+                if (ultima_dt is None) or (dt_obj > ultima_dt):
+                    ultima_dt = dt_obj
+
+            if ultima_dt is not None:
+                ultima_dt_br = ultima_dt.astimezone(_BR_TZ)
+                # se a última presença é anterior ao marco do ciclo atual, zera
+                if ultima_dt_br < marco:
                     try:
-                        dt_tmp = pd.to_datetime(dh, errors="coerce")
-                        if pd.notna(dt_tmp):
-                            dts.append(dt_tmp.to_pydatetime())
+                        supabase.table("presencas").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
                     except Exception:
+                        # não derruba o app por falha de limpeza
                         pass
-
-            if dts:
-                last_dt = max(dts)
-                if getattr(last_dt, "tzinfo", None) is None:
-                    last_dt = pytz.UTC.localize(last_dt)
-                last_dt_br = last_dt.astimezone(tz)
-            else:
-                last_dt_br = None
-
-            if last_dt_br and last_dt_br < proximo_marco_br:
-                supabase.table("presencas").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-                st.session_state["_presencas_limpo_em"] = datetime.now(tz)
-                st.rerun()
         except Exception:
             pass
-    # Regras de abertura/fechamento (idênticas)
-    if dia_semana == 5:  # Sábado
-        is_aberto = False
-    elif dia_semana == 6:  # Domingo
-        is_aberto = (hora_atual >= time(19, 0))
-    elif dia_semana == 4:  # Sexta
-        if hora_atual >= time(17, 0):
-            is_aberto = False
-        elif time(5, 0) <= hora_atual < time(7, 0):
-            is_aberto = False
-        else:
-            is_aberto = True
-    else:  # Segunda a Quinta
-        if (time(5, 0) <= hora_atual < time(7, 0)) or (time(17, 0) <= hora_atual < time(19, 0)):
-            is_aberto = False
-        else:
-            is_aberto = True
 
-    janela_conferencia = (time(5, 0) < hora_atual < time(7, 0)) or (time(17, 0) < hora_atual < time(19, 0))
+    # 2) Status de janela aberta/fechada e janela de conferência
+    # Regra: abre 06:30-07:00 (embarque manhã) e 18:30-19:00 (embarque tarde)
+    is_aberto = False
+    janela_conferencia = False
+
+    if time(6, 30) <= hora_atual <= time(7, 0):
+        is_aberto = True
+    elif time(18, 30) <= hora_atual <= time(19, 0):
+        is_aberto = True
+    else:
+        is_aberto = False
+
+    # Janela de conferência: 07:00-07:10 e 19:00-19:10
+    if time(7, 0) <= hora_atual <= time(7, 10):
+        janela_conferencia = True
+    elif time(19, 0) <= hora_atual <= time(19, 10):
+        janela_conferencia = True
+
     return is_aberto, janela_conferencia
 
 # ==========================================================
@@ -765,43 +770,51 @@ def user_to_ui_dict(u: dict) -> dict:
     }
     return ui
 
-def map_user_row(user_row: dict) -> dict:
-    """Normaliza o registro do usuário (dict) para uso no app inteiro.
-
-    - Aceita chaves em minúsculo (banco) e também variações usadas no app (Nome, Graduação etc.).
-    - Retorna um dict com chaves canônicas (minúsculas) e ALIAS em maiúsculas para compatibilidade.
+def _pick(row, *keys, default=None):
+    """Retorna o primeiro valor não-vazio encontrado em 'row' para qualquer uma das chaves informadas.
+    Também tenta variações em maiúsculo/minúsculo automaticamente.
     """
-    if not isinstance(user_row, dict):
-        return {}
-
-    def _g(*keys, default=""):
-        for k in keys:
-            if k in user_row and user_row.get(k) is not None:
-                return user_row.get(k)
+    if row is None:
         return default
+    for k in keys:
+        if k in row and row.get(k) not in (None, ""):
+            return row.get(k)
+        ku = k.upper()
+        kl = k.lower()
+        if ku in row and row.get(ku) not in (None, ""):
+            return row.get(ku)
+        if kl in row and row.get(kl) not in (None, ""):
+            return row.get(kl)
+    return default
 
-    _id = _g("id", "ID", default=None)
-    nome = _g("nome", "Nome", "NOME", default="")
-    email = _g("email", "Email", "E-mail", "EMAIL", default="")
-    telefone = _g("telefone", "Telefone", "TELEFONE", default="")
-    graduacao = _g("graduacao", "Graduacao", "Graduação", "GRADUACAO", "GRADUAÇÃO", default="")
-    lotacao = _g("lotacao", "Lotacao", "Lotação", "LOTACAO", "LOTAÇÃO", default="")
-    origem = _g("origem", "Origem", "ORIGEM", default="")
-    senha = _g("senha", "Senha", "SENHA", default="")
-    status = _g("status", "STATUS", "ativo", "ATIVO", default="")  # aceita legado
+def map_user_row(row):
+    """Normaliza uma linha da tabela 'usuarios' para um dicionário padrão usado no app."""
+    # Aceita várias nomenclaturas (por segurança, pois seu DB pode ter colunas com nomes diferentes)
+    user_id = _pick(row, "id", "usuario_id", "user_id")
+    nome = _pick(row, "nome", "nome_escala", "nome_de_escala", "nome_esc", "nome_completo", default="")
+    email = _pick(row, "email", "e-mail", "mail", default="")
+    telefone = _pick(row, "telefone", "tel", "celular", default="")
+    graduacao = _pick(row, "graduacao", "grad", default="")
+    lotacao = _pick(row, "lotacao", "lot", default="")
+    origem = _pick(row, "origem", "qg_rmcf_outros", "qg", default="")
+    senha = _pick(row, "senha", "password", "senha_plana", default="")
+    senha_hash = _pick(row, "senha_hash", "password_hash", "hash_senha")
+    status_raw = _pick(row, "status", "STATUS", "ativo", "aprovado", default=None)
 
-    # Normalização do status
-    status_norm = str(status).strip().upper() if status is not None else ""
-    if status_norm in ("TRUE", "1", "SIM", "ATIVO", "ATIVA"):
+    # Normaliza status
+    status_norm = "ATIVO"
+    if status_raw in (None, ""):
         status_norm = "ATIVO"
-    elif status_norm in ("FALSE", "0", "NAO", "NÃO", "INATIVO", "INATIVA", "PENDENTE"):
-        status_norm = "PENDENTE"
-    elif not status_norm:
-        # se não existe coluna, trate como ATIVO para não quebrar logins antigos
-        status_norm = "ATIVO"
+    elif isinstance(status_raw, bool):
+        status_norm = "ATIVO" if status_raw else "PENDENTE"
+    else:
+        s = str(status_raw).strip().upper()
+        status_norm = s if s else "ATIVO"
 
-    out = {
-        "id": _id,
+    last_rec = _pick(row, "last_recuperacao_dados_at", "last_recuperacao_at", "last_recuperacao", "ultima_recuperacao")
+
+    return {
+        "id": user_id,
         "nome": str(nome) if nome is not None else "",
         "email": str(email) if email is not None else "",
         "telefone": str(telefone) if telefone is not None else "",
@@ -809,16 +822,21 @@ def map_user_row(user_row: dict) -> dict:
         "lotacao": str(lotacao) if lotacao is not None else "",
         "origem": str(origem) if origem is not None else "",
         "senha": str(senha) if senha is not None else "",
+        "senha_hash": senha_hash,
+        "last_recuperacao_dados_at": last_rec,
         "status": status_norm,
         "STATUS": status_norm,
+
+        # chaves usadas na UI antiga (mantém compatibilidade)
         "NOME": str(nome) if nome is not None else "",
         "EMAIL": str(email) if email is not None else "",
         "TELEFONE": str(telefone) if telefone is not None else "",
         "GRADUAÇÃO": str(graduacao) if graduacao is not None else "",
         "LOTAÇÃO": str(lotacao) if lotacao is not None else "",
         "ORIGEM": str(origem) if origem is not None else "",
+        "SENHA": str(senha) if senha is not None else "",
     }
-    return out
+
 
 
 def _senha_temp_valida(u_dict):
@@ -1351,9 +1369,17 @@ try:
         if st.session_state._force_refresh_presenca:
             buscar_presenca_atualizada.clear()
             st.session_state._force_refresh_presenca = False
+        # Defaults (evita NameError se algo falhar no meio)
+        presencas_raw = []
+        aberto = False
+        janela_conferencia = False
+        usuario_id_logado = None
+        ciclo_data = None
+        ciclo_data_iso = None
+        ciclo_hora = None
+        turno_atual = None
 
         presencas_raw = buscar_presenca_atualizada()
-
         # === Ciclo atual (data/hora) ===
         ciclo_hora, ciclo_data_br = obter_ciclo_atual()
         try:
