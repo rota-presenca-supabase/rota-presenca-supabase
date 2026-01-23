@@ -762,6 +762,21 @@ def user_to_ui_dict(u: dict) -> dict:
         "last_recuperacao_dados_at": u.get("last_recuperacao_dados_at"),
     }
     return ui
+
+def map_user_row(user_row: dict) -> dict:
+    """Normaliza o registro do usuário (dict) para uso em e-mails/formulários."""
+    if not isinstance(user_row, dict):
+        return {}
+    return {
+        "nome": user_row.get("nome") or user_row.get("Nome") or "",
+        "email": user_row.get("email") or user_row.get("Email") or "",
+        "telefone": user_row.get("telefone") or user_row.get("Telefone") or "",
+        "graduacao": user_row.get("graduacao") or user_row.get("Graduação") or "",
+        "lotacao": user_row.get("lotacao") or user_row.get("Lotação") or "",
+        "origem": user_row.get("origem") or user_row.get("Origem") or "",
+        "senha": user_row.get("senha") or user_row.get("Senha") or "",
+    }
+
 def _senha_temp_valida(u_dict):
     temp = str(u_dict.get("TEMP_SENHA", "") or "").strip()
     usada = u_dict.get("TEMP_USADA", None)
@@ -795,11 +810,22 @@ def _senha_temp_valida(u_dict):
     return _br_now() <= exp_dt
 
 def _senha_confere(u_dict, senha_digitada: str):
+    """Confere senha real e (opcional) senha temporária.
+    Retorna (tipo, ok) onde tipo é 'REAL' ou 'TEMP'.
+    """
     senha_digitada = str(senha_digitada or "").strip()
-    if str(u_dict.get("Senha", "")).strip() == senha_digitada:
+
+    # senha "real" (coluna atual)
+    senha_real = str(u_dict.get("senha") or u_dict.get("Senha") or "").strip()
+    if senha_real and senha_real == senha_digitada:
         return ("REAL", True)
-    if _senha_temp_valida(u_dict) and str(u_dict.get("TEMP_SENHA", "")).strip() == senha_digitada:
+
+    # senha temporária (se existir no schema)
+    # aceita nomes antigos/novos para compatibilidade
+    temp_senha = str(u_dict.get("temp_senha") or u_dict.get("TEMP_SENHA") or "").strip()
+    if temp_senha and temp_senha == senha_digitada and _senha_temp_valida(u_dict):
         return ("TEMP", True)
+
     return ("", False)
 
 def buscar_user_by_email_tel(email: str, tel_digits: str):
